@@ -420,33 +420,39 @@ code{font-family:monospace;background:var(--bg);padding:1px 4px;border-radius:3p
   .top{padding:0 10px;gap:6px;height:48px;}
   .tabs{padding:0 6px;top:48px;}
   .tab{padding:8px 10px;font-size:11px;white-space:nowrap;}
-  .content{padding:8px 10px;}
+  .content{padding:8px 8px;}
   .cards{grid-template-columns:repeat(2,1fr);gap:7px;margin-bottom:10px;}
   .card{padding:8px 10px;}.cv{font-size:22px;}.cl{font-size:10px;}
   .tw{overflow-x:auto;}table{min-width:600px;}
   th,td{padding:5px 7px;font-size:11px;}
-  .plan-wrap,.lav-wrap{flex-direction:column;height:auto;overflow:visible;}
-  .plan-sb,.lav-sb{width:100%!important;max-width:100%!important;height:100px;overflow-x:auto;overflow-y:hidden;}
-  .sb-body{display:flex!important;flex-direction:row!important;gap:6px;padding:4px 8px!important;overflow-x:auto;}
-  .plan-main,.lav-main,.plan-main>div{width:100%;}
-  .grid-outer{height:55vh;}
-  .th-tc,.gr-cell{min-width:80px!important;}
+  /* Planificador / Lavadero */
+  .plan-wrap,.lav-wrap{flex-direction:column;height:auto;overflow:visible;gap:6px;}
+  .plan-sb,.lav-sb{width:100%!important;max-width:100%!important;min-height:unset!important;height:auto!important;border-bottom:none!important;border-radius:8px;}
+  .sb-body{display:flex!important;flex-direction:row!important;gap:6px;padding:6px 8px!important;overflow-x:auto;overflow-y:hidden;max-height:130px;}
+  .sb-card{min-width:130px!important;flex-shrink:0;}
+  .plan-main,.lav-main{width:100%;border-radius:8px;}
+  .grid-outer{height:60vh;overflow:auto;-webkit-overflow-scrolling:touch;}
+  .th-tc{min-width:90px!important;padding:4px 5px!important;}
+  .gr-cell{min-width:90px!important;}
   .th-tm,.gr-tm,.slot-lbl{width:44px!important;font-size:9px!important;}
+  .blk-dom{font-size:10px!important;}.blk-inf{font-size:9px!important;}
+  .plan-blk{padding:3px 5px!important;}
   .msel-btn{min-width:90px;font-size:11px;padding:4px 7px;}
   .th2{flex-wrap:wrap;gap:5px;}
-  .modal{width:95vw!important;max-width:95vw!important;padding:14px!important;}
+  .modal{width:96vw!important;max-width:96vw!important;padding:14px!important;}
   .btn{padding:5px 9px;font-size:11px;}
-  /* Tabla de turnos — ocultar columnas menos críticas */
-  table th:nth-child(2),table td:nth-child(2){display:none;} /* Tipo */
-  table th:nth-child(9),table td:nth-child(9){display:none;} /* Cargó turno */
+  table th:nth-child(2),table td:nth-child(2){display:none;}
+  table th:nth-child(9),table td:nth-child(9){display:none;}
 }
 @media(max-width:480px){
   .tab{font-size:10px;padding:7px 7px;}
   .cards{grid-template-columns:repeat(2,1fr);}
   .msel-btn{min-width:70px;font-size:10px;}
-  .th-tc,.gr-cell{min-width:65px!important;}
-  table th:nth-child(4),table td:nth-child(4){display:none;} /* Marca */
-  table th:nth-child(8),table td:nth-child(8){display:none;} /* Asesor en tabla */
+  .th-tc,.gr-cell{min-width:75px!important;}
+  .grid-outer{height:55vh;}
+  table th:nth-child(4),table td:nth-child(4){display:none;}
+  table th:nth-child(8),table td:nth-child(8){display:none;}
+  #plan-kpi-trabajando,#plan-kpi-nuevos,#plan-kpi-carry{font-size:14px!important;}
 }
 </style>
 </head>
@@ -1107,7 +1113,15 @@ function openSettings(){
   else{toast('Modo local activado');}
 }
 function saveL(){localStorage.setItem('st2',JSON.stringify(S));}
-function loadLocal(){const s=localStorage.getItem('st2');if(s)S=JSON.parse(s);}
+function loadLocal(){
+  const s=localStorage.getItem('st2');
+  if(s){
+    S=JSON.parse(s);
+    // Eliminar datos sensibles que puedan haber quedado
+    if(S.turnos) S.turnos.forEach(function(t){delete t.tel;delete t.mail;});
+    if(S.history) S.history.forEach(function(h){(h.turnos||[]).forEach(function(t){delete t.tel;delete t.mail;});});
+  }
+}
 
 // ===== SYNC =====
 // Utilidad: fetch con reintentos automáticos
@@ -1177,7 +1191,7 @@ async function syncNow(silent){
     if(d.lavFinalizados) S.lavFinalizados=d.lavFinalizados;
     if(d.turnos!==undefined && Date.now()>_turnosDirtyUntil){
       if(d.turnos.length>0){
-        S.turnos=d.turnos;
+        S.turnos=d.turnos.map(function(t){delete t.tel;delete t.mail;return t;});
         if(d.turnosFecha) S.turnosFecha=d.turnosFecha.substring(0,10);
       } else if(!S.htmlCargado){
         S.turnos=[];S.turnosFecha='';
