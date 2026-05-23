@@ -206,7 +206,7 @@ tr.row-prior td{background:#bfdbfe;color:#1e3a8a;}
 .gr-cell:last-child{border-right:none}
 .gr-cell.dov{background:var(--ac2);outline:2px dashed var(--ac);outline-offset:-2px}
 /* Tarjetas estiradas — span multi-hora */
-.plan-blk{border-left:3px solid;border-radius:5px;padding:4px 8px;font-size:11px;cursor:pointer;margin-bottom:3px;position:relative;box-sizing:border-box;overflow:visible}
+.plan-blk{border-left:3px solid;border-radius:5px;padding:4px 8px;font-size:11px;cursor:pointer;margin-bottom:3px;position:relative;box-sizing:border-box;overflow:visible;touch-action:none;}
 .plan-blk.stretched{position:absolute;left:3px;right:3px;z-index:2;margin:0;overflow:hidden;transition:height .15s,box-shadow .15s;}
 .plan-blk.stretched:hover{overflow:visible;z-index:50;box-shadow:0 4px 20px rgba(0,0,0,.18);}
 .plan-blk.stretched:hover .blk-expand{display:block;}
@@ -414,6 +414,40 @@ code{font-family:monospace;background:var(--bg);padding:1px 4px;border-radius:3p
 ::-webkit-scrollbar-thumb{background:var(--tx3);border-radius:5px;border:2px solid var(--sur2)}
 ::-webkit-scrollbar-thumb:hover{background:var(--tx2)}
 ::-webkit-scrollbar-corner{background:var(--sur2)}
+
+/* ===== RESPONSIVE ===== */
+@media(max-width:768px){
+  .top{padding:0 10px;gap:6px;height:48px;}
+  .tabs{padding:0 6px;top:48px;}
+  .tab{padding:8px 10px;font-size:11px;white-space:nowrap;}
+  .content{padding:8px 10px;}
+  .cards{grid-template-columns:repeat(2,1fr);gap:7px;margin-bottom:10px;}
+  .card{padding:8px 10px;}.cv{font-size:22px;}.cl{font-size:10px;}
+  .tw{overflow-x:auto;}table{min-width:600px;}
+  th,td{padding:5px 7px;font-size:11px;}
+  .plan-wrap,.lav-wrap{flex-direction:column;height:auto;overflow:visible;}
+  .plan-sb,.lav-sb{width:100%!important;max-width:100%!important;height:100px;overflow-x:auto;overflow-y:hidden;}
+  .sb-body{display:flex!important;flex-direction:row!important;gap:6px;padding:4px 8px!important;overflow-x:auto;}
+  .plan-main,.lav-main,.plan-main>div{width:100%;}
+  .grid-outer{height:55vh;}
+  .th-tc,.gr-cell{min-width:80px!important;}
+  .th-tm,.gr-tm,.slot-lbl{width:44px!important;font-size:9px!important;}
+  .msel-btn{min-width:90px;font-size:11px;padding:4px 7px;}
+  .th2{flex-wrap:wrap;gap:5px;}
+  .modal{width:95vw!important;max-width:95vw!important;padding:14px!important;}
+  .btn{padding:5px 9px;font-size:11px;}
+  /* Tabla de turnos — ocultar columnas menos críticas */
+  table th:nth-child(2),table td:nth-child(2){display:none;} /* Tipo */
+  table th:nth-child(9),table td:nth-child(9){display:none;} /* Cargó turno */
+}
+@media(max-width:480px){
+  .tab{font-size:10px;padding:7px 7px;}
+  .cards{grid-template-columns:repeat(2,1fr);}
+  .msel-btn{min-width:70px;font-size:10px;}
+  .th-tc,.gr-cell{min-width:65px!important;}
+  table th:nth-child(4),table td:nth-child(4){display:none;} /* Marca */
+  table th:nth-child(8),table td:nth-child(8){display:none;} /* Asesor en tabla */
+}
 </style>
 </head>
 <body>
@@ -1252,8 +1286,8 @@ function parseHTML(html){
       dominio:dom,modelo:g('Report1-RwEf-2'),hora:g('Report1-RwDtTm-6'),
       asesor,cargoPor:g('Report1-RwEf-15'),cliente:g('Report1-RwEf-13'),
       servicio:g('Report1-RwEf-11'),req:g('Report1-RwEf-14'),
-      estadoR:g('Report1-RwEf-21a'),mail:g('Report1-RwEf-22'),
-      tel:g('Report1-RwEf-6')||g('Report1-RwEf-9'),chasis:g('Report1-RwEf-19'),
+      estadoR:g('Report1-RwEf-21a'),
+      chasis:g('Report1-RwEf-19'),
       contacto:g('Report1-RwEf-18'),
       ingresado:!g('Report1-RwEf-21a').toLowerCase().includes('no ingres'),
       suc:sucOf(asesor),
@@ -3606,7 +3640,7 @@ function openTurnoDetail(t){
   const rows=[
     ['🕐 Hora',t.hora],['👤 Cliente',t.cliente],['🔧 Modelo',t.modelo],
     ['📋 Asesor',t.asesor],['🏢 Sucursal',suc],['📌 Tipo',t.tipo],
-    ['📞 Teléfono',t.tel],['📧 Mail',t.mail],['🔢 Chasis',t.chasis],['👤 Cargó turno',t.cargoPor],
+    ['🔢 Chasis',t.chasis],['👤 Cargó turno',t.cargoPor],
   ].filter(function(r){return r[1]&&String(r[1]).trim();});
   const overlay=document.createElement('div');
   overlay.id='turno-detail-modal';
