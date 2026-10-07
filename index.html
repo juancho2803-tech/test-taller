@@ -352,6 +352,12 @@ tr.row-prior td{background:#bfdbfe;color:#1e3a8a;}
 .tc-siniestro{background:#fef9c3!important;border-left:3px solid #ca8a04!important;}
 .tc-diagnostico{background:#dbeafe!important;border-left:3px solid #2563eb!important;}
 .tc-garantia{background:#fed7aa!important;border-left:3px solid #ea580c!important;}
+/* Texto oscuro fijo sobre los fondos claros de tipo de trabajo (legible en claro y oscuro) */
+.tc-servicio,.tc-servicio .blk-dom,.tc-servicio .blk-inf{color:#064e3b!important;}
+.tc-siniestro,.tc-siniestro .blk-dom,.tc-siniestro .blk-inf{color:#713f12!important;}
+.tc-diagnostico,.tc-diagnostico .blk-dom,.tc-diagnostico .blk-inf{color:#1e3a8a!important;}
+.tc-garantia,.tc-garantia .blk-dom,.tc-garantia .blk-inf{color:#7c2d12!important;}
+.plan-blk.blk-fin .blk-inf{color:var(--card-fin-tx)!important;}
 /* EXPRESS TOGGLE */
 .express-toggle{background:none;border:1px solid var(--bor);border-radius:5px;cursor:pointer;font-size:13px;padding:2px 6px;color:var(--tx3);transition:all .15s;line-height:1}
 .express-toggle:hover{border-color:var(--ex);color:var(--ex);background:var(--ex2)}
@@ -468,7 +474,7 @@ code{font-family:monospace;background:var(--bg);padding:1px 4px;border-radius:3p
     <div class="step"><strong>1 — Crear la hoja</strong><br><a href="https://sheets.new" target="_blank">sheets.new</a> → copiar el ID de la URL:<br><code>spreadsheets/d/<strong>[ID]</strong>/edit</code></div>
     <div class="step"><strong>2 — Apps Script</strong><br>Extensiones → Apps Script → pegar el código → guardar.<br><button class="btn btn-s" onclick="copyScript()" style="margin-top:5px;">📋 Copiar código Apps Script</button></div>
     <div class="step"><strong>3 — Publicar</strong><br>Implementar → Nueva implementación → Web App<br>Ejecutar como: <em>Yo</em> · Acceso: <em>Cualquiera</em> → copiar URL.</div>
-    <div class="fg" style="margin-bottom:12px;"><label>URL del Web App</label><input type="url" id="api-in" placeholder="https://script.google.com/macros/s/.../exec"/></div>
+    <div class="fg" style="margin-bottom:12px;"><label>URL del Web App</label><input type="url" id="api-in" placeholder="https://script.google.com/macros/s/.../exec" value="https://script.google.com/macros/s/AKfycbwsoHpL3xo9jw4ocZYGmBj8_xlb5lSdtRnRDbvO3VkxnxVkbx2M4fU77H83WklRYk83/exec"/></div>
     <div style="display:flex;gap:7px;">
       <button class="btn btn-p" onclick="saveConfig()">Guardar y continuar</button>
       <button class="btn btn-s" onclick="skipSetup()">Modo local</button>
@@ -1181,9 +1187,15 @@ function fechaLocalISO(d){
 function updDate(){document.getElementById('tdt').textContent=new Date().toLocaleDateString('es-AR',{weekday:'short',day:'numeric',month:'short'});}
 
 // ===== CONFIG =====
-function loadCFG(){const c=localStorage.getItem('cfg2');if(c){CFG=JSON.parse(c);sh('app');hi('sov');loadLocal();syncNow();renderAll();}else{sh('sov');hi('app');}}
-function saveConfig(){const u=document.getElementById('api-in').value.trim();if(!u){toast('Ingresá la URL');return;}CFG={apiUrl:u,offline:false};localStorage.setItem('cfg2',JSON.stringify(CFG));sh('app');hi('sov');loadLocal();syncNow();renderAll();toast('✓ Configurado');}
-function skipSetup(){CFG={apiUrl:'',offline:true};localStorage.setItem('cfg2',JSON.stringify(CFG));sh('app');hi('sov');loadLocal();renderAll();}
+// URL del Web App por defecto: una PC sin configurar (o que quedó en "Modo local") se conecta sola
+const DEFAULT_API_URL='https://script.google.com/macros/s/AKfycbwsoHpL3xo9jw4ocZYGmBj8_xlb5lSdtRnRDbvO3VkxnxVkbx2M4fU77H83WklRYk83/exec';
+function loadCFG(){
+  let cfg=null;
+  try{ cfg=JSON.parse(localStorage.getItem('cfg2')||'null'); }catch(e){}
+  if(!cfg||!cfg.apiUrl){ cfg={apiUrl:DEFAULT_API_URL,offline:false}; localStorage.setItem('cfg2',JSON.stringify(cfg)); }
+  CFG=cfg; sh('app');hi('sov');loadLocal();syncNow();renderAll();
+}
+function skipSetup(){CFG={apiUrl:'',offline:true};sh('app');hi('sov');loadLocal();renderAll();} // solo esta sesión
 function openSettings(){
   const u=prompt('URL Apps Script (pegá la URL del Web App):',CFG.apiUrl||'');
   if(u===null)return;
@@ -1196,7 +1208,18 @@ function openSettings(){
 function saveL(){
   // Mantener sincronizado el snapshot de asignaciones del día activo
   try{ if(typeof guardarAsgnSnapshot==='function') guardarAsgnSnapshot(); }catch(e){}
-  localStorage.setItem('st2',JSON.stringify(S));
+  try{ localStorage.setItem('st2',JSON.stringify(S)); }
+  catch(e){
+    // localStorage lleno: guardar una copia liviana (sin los turnos de días viejos,
+    // que se vuelven a traer del servidor). La memoria de la sesión queda intacta.
+    try{
+      const lim=fechaLocalISO(new Date(Date.now()-14*86400000));
+      const liv=Object.assign({},S,{history:(S.history||[]).map(function(h){
+        return (h.date||'')<lim?{date:h.date,count:h.count,turnos:[]}:h;
+      })});
+      localStorage.setItem('st2',JSON.stringify(liv));
+    }catch(e2){ console.warn('No se pudo guardar en localStorage',e2); }
+  }
 }
 function loadLocal(){
   const s=localStorage.getItem('st2');
@@ -1231,80 +1254,196 @@ async function fetchWithRetry(url, opts, maxRetries=3){
   throw lastErr;
 }
 
+// ===== SYNC 3 VÍAS (v2) =====
+// Cada PC guarda en S._base una huella (hash) de lo último que vio en el servidor
+// para asignaciones, lavadero, snapshots por fecha, finalizados y entregas.
+// Lo que difiere de esa base es un cambio local pendiente: se envía como PARCHE
+// (solo las claves / ids tocados). El servidor aplica el parche sobre su copia,
+// así dos PCs trabajando a la vez ya no se pisan entre sí.
+const SYNC_MAP_FIELDS={asgn:'updateAsgn',lavAsgn:'updateLavAsgn',asgnHistory:'saveAsgnHistory'};
+const SYNC_LIST_FIELDS={finalizados:'saveFinalizados',entregas:'saveEntregas'};
+const SYNC_FIELDS=Object.keys(SYNC_MAP_FIELDS).concat(Object.keys(SYNC_LIST_FIELDS));
+const _ACTION_FIELD={updateAsgn:'asgn',updateLavAsgn:'lavAsgn',saveAsgnHistory:'asgnHistory',saveFinalizados:'finalizados',saveEntregas:'entregas'};
+let _srvV2=null;        // null = aún no se sabe; true = servidor con parches; false = servidor viejo
+let _ackAt={};          // 'campo|clave' -> ms en que el servidor confirmó ese cambio
+let _flushing={};       // campo -> envío en curso
+let _syncBusy=false;    // evita syncs superpuestos
+let _syncPausaHasta=0;  // pausa el sync (p.ej. tras resetear la base)
+let _lastFullSync=0;    // último sync con historial completo
+
+function _h(s){ // hash FNV-1a 32 bits + largo
+  let h=0x811c9dc5;
+  for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,0x01000193);}
+  return (h>>>0).toString(36)+':'+s.length;
+}
+function _isList(f){return Object.prototype.hasOwnProperty.call(SYNC_LIST_FIELDS,f);}
+function _asMap(f,val){
+  if(_isList(f)){
+    const m={};
+    (Array.isArray(val)?val:[]).forEach(function(x){ if(x&&x.id!=null) m[x.id]=x; });
+    return m;
+  }
+  return (val&&typeof val==='object'&&!Array.isArray(val))?val:{};
+}
+function _hashMap(m){const o={};Object.keys(m).forEach(function(k){o[k]=_h(JSON.stringify(m[k]));});return o;}
+function _ensureBase(){
+  if(!S._base||typeof S._base!=='object') S._base={};
+  SYNC_FIELDS.forEach(function(f){
+    if(!S._base[f]||typeof S._base[f]!=='object') S._base[f]=_hashMap(_asMap(f,S[f]));
+  });
+}
+function _pending(f){
+  _ensureBase();
+  const loc=_asMap(f,S[f]), base=S._base[f], set={}, del=[];
+  Object.keys(loc).forEach(function(k){ if(base[k]!==_h(JSON.stringify(loc[k]))) set[k]=loc[k]; });
+  Object.keys(base).forEach(function(k){ if(!Object.prototype.hasOwnProperty.call(loc,k)) del.push(k); });
+  return {set:set,del:del,n:Object.keys(set).length+del.length};
+}
+function _fromMap(f,m){return _isList(f)?Object.keys(m).map(function(k){return m[k];}):m;}
+
+// Reconciliación de una sola vez (primer sync con esta versión): se toma el servidor
+// como base y se suman los ítems locales recientes (2 días) que el servidor no tiene,
+// para no perder trabajo que nunca llegó a guardarse (p.ej. por límite de celda).
+function _recienteMs(x){
+  const s=(x&&(x.at||x.finAt||x.createdAt))||'';
+  const t=Date.parse(String(s).replace(' ','T'));
+  return isNaN(t)?0:t;
+}
+function _reconciliarInicial(f,srv){
+  const loc=_asMap(f,S[f]), out=Object.assign({},srv), lim=Date.now()-2*86400000;
+  if(_isList(f)){
+    Object.keys(loc).forEach(function(id){ if(!out[id] && _recienteMs(loc[id])>=lim) out[id]=loc[id]; });
+    return out;
+  }
+  if(f==='asgnHistory'){
+    Object.keys(loc).forEach(function(k){ if(!out[k]) out[k]=loc[k]; });
+    return out;
+  }
+  // asgn / lavAsgn: unir por ítem dentro de cada franja
+  const idOf=function(a){return a&&(a.tid||a.turnoId);};
+  Object.keys(loc).forEach(function(k){
+    const la=Array.isArray(loc[k])?loc[k]:[];
+    const sa=Array.isArray(out[k])?out[k].slice():[];
+    let cambio=false;
+    la.forEach(function(a){
+      if(_recienteMs(a)<lim) return;
+      if(!sa.some(function(b){return idOf(b)===idOf(a);})){ sa.push(a); cambio=true; }
+    });
+    if(cambio||(!out[k]&&sa.length)) out[k]=sa;
+  });
+  return out;
+}
+
+// Mezcla al recibir del servidor: servidor + mis cambios pendientes.
+function _mergeField(f,srvVal,getStartedAt){
+  if(srvVal==null) return; // el servidor no pudo leer ese dato: no tocar nada
+  if(_isList(f)&&!Array.isArray(srvVal)) return;
+  if(!_isList(f)&&(typeof srvVal!=='object'||Array.isArray(srvVal))) return;
+  const srv=_asMap(f,srvVal);
+  if(!S._base||!S._base[f]){
+    if(!S._base||typeof S._base!=='object') S._base={};
+    S._base[f]=_hashMap(srv);
+    S[f]=_fromMap(f,_reconciliarInicial(f,srv));
+    return;
+  }
+  const loc=_asMap(f,S[f]), p=_pending(f);
+  const out=Object.assign({},srv), base=_hashMap(srv);
+  Object.keys(p.set).forEach(function(k){ out[k]=p.set[k]; });
+  p.del.forEach(function(k){ delete out[k]; });
+  // Cambios confirmados DESPUÉS de iniciar esta lectura: la respuesta está vieja para esas claves
+  Object.keys(_ackAt).forEach(function(ak){
+    const i=ak.indexOf('|'); if(ak.slice(0,i)!==f) return;
+    if(_ackAt[ak]<getStartedAt) return;
+    const k=ak.slice(i+1);
+    if(Object.prototype.hasOwnProperty.call(loc,k)){ out[k]=loc[k]; base[k]=_h(JSON.stringify(loc[k])); }
+    else { delete out[k]; delete base[k]; }
+  });
+  S._base[f]=base;
+  S[f]=_fromMap(f,out);
+}
+
+async function _postJSON(body){
+  const r=await fetchWithRetry(CFG.apiUrl,{method:'POST',redirect:'follow',body:JSON.stringify(body),headers:{'Content-Type':'text/plain'}});
+  let d=null;
+  try{ d=await r.json(); }catch(e){ throw new Error('Respuesta inválida del servidor'); }
+  if(!d||d.ok===false) throw new Error((d&&d.msg)||'El servidor rechazó el guardado');
+  return d;
+}
+
+async function _pushFieldOnce(f){
+  if(CFG.offline||!CFG.apiUrl) return;
+  if(_srvV2===null) return; // se envía después del primer sync (cuando se conoce la versión del servidor)
+  const p=_pending(f);
+  if(!p.n) return;
+  let sentSet=p.set, sentDel=p.del;
+  if(_srvV2){
+    const payload={field:f,del:p.del};
+    if(_isList(f)) payload.upsert=Object.keys(p.set).map(function(k){return p.set[k];});
+    else payload.set=p.set;
+    const d=await _postJSON({action:'patch',payload:payload});
+    if(!(d&&d.v>=2)){ _srvV2=false; return _pushFieldOnce(f); }
+  } else {
+    // Servidor viejo: se envía el objeto completo (como antes)
+    const loc=_asMap(f,S[f]);
+    sentSet=loc; sentDel=Object.keys(S._base[f]).filter(function(k){return !Object.prototype.hasOwnProperty.call(loc,k);});
+    await _postJSON({action:SYNC_MAP_FIELDS[f]||SYNC_LIST_FIELDS[f],payload:S[f]});
+  }
+  const now=Date.now();
+  Object.keys(sentSet).forEach(function(k){ S._base[f][k]=_h(JSON.stringify(sentSet[k])); _ackAt[f+'|'+k]=now; });
+  sentDel.forEach(function(k){ delete S._base[f][k]; _ackAt[f+'|'+k]=now; });
+  saveL();
+}
+
+function pushField(f){
+  if(_flushing[f]){ _flushing[f].again=true; return _flushing[f].p; }
+  const st={again:false};
+  st.p=(async function(){
+    try{ await _pushFieldOnce(f); }
+    finally{
+      const again=st.again; _flushing[f]=null;
+      if(again) pushField(f);
+    }
+  })();
+  _flushing[f]=st;
+  return st.p;
+}
+
+async function flushPendientes(){
+  for(const f of SYNC_FIELDS){
+    try{ await pushField(f); }catch(e){ setSd('err',e.message||'Error al guardar'); }
+  }
+}
+
+// Limpia marcas de confirmación viejas (solo sirven unos segundos)
+setInterval(function(){
+  const lim=Date.now()-120000;
+  Object.keys(_ackAt).forEach(function(k){ if(_ackAt[k]<lim) delete _ackAt[k]; });
+},60000);
+
 async function syncNow(silent){
-  if(CFG.offline||!CFG.apiUrl){setSd('off');return;}setSd('sync');
+  if(CFG.offline||!CFG.apiUrl){setSd('off');return;}
+  if(_syncBusy||Date.now()<_syncPausaHasta) return; // evita syncs superpuestos
+  _syncBusy=true; setSd('sync');
   try{
-    const r=await fetchWithRetry(CFG.apiUrl+'?t='+Date.now(),{redirect:'follow'});
+    // 1) Primero se envían los cambios locales pendientes
+    if(_srvV2!==null) await flushPendientes();
+    // 2) Lectura: historial completo al iniciar y cada 30 min; el resto, liviano
+    const _full=(Date.now()-_lastFullSync)>30*60000;
+    const _t0=Date.now();
+    const r=await fetchWithRetry(CFG.apiUrl+'?t='+_t0+(_full?'&full=1':''),{redirect:'follow'});
     const d=await r.json();
     if(!d.ok)throw new Error(d.msg||'error');
-    if(d.entregas){
-      if(Date.now()>_entregasDirtyUntil){
-        S.entregas=(d.entregas||[]).map(function(e){
-          return Object.assign({estado:'pendiente',obs:'',entregadoAt:''},e,{estado:e.estado||'pendiente'});
-        });
-      } else {
-        (d.entregas||[]).forEach(function(se){
-          const le=S.entregas.find(function(e){return e.id===se.id;});
-          if(!le) S.entregas.push(Object.assign({estado:'pendiente'},se));
-        });
-      }
+    if(_full) _lastFullSync=Date.now();
+    const _primerSync=(_srvV2===null);
+    _srvV2=!!(d.v>=2);
+    if(Array.isArray(d.entregas)){
+      _mergeField('entregas',d.entregas,_t0);
+      S.entregas=(S.entregas||[]).map(function(e){
+        return Object.assign({estado:'pendiente',obs:'',entregadoAt:''},e,{estado:e.estado||'pendiente'});
+      });
     }
-    if(d.asgn && typeof d.asgn==='object'){
-      // Estrategia simple y robusta:
-      // - Si dirty activo: NO tocar S.asgn en absoluto (proteger trabajo local)
-      // - Si dirty expiró: el servidor es la verdad, pero preservamos
-      //   cualquier key local que tenga turnos del día actual (asignaciones recientes)
-      if(Date.now()<=_asgnDirtyUntil){
-        // Dirty activo — no hacer nada, conservar todo lo local
-      } else {
-        const turnosHoyIds=new Set((getTurnosParaFecha(planDate)||[]).map(function(t){return t.id;}));
-        // Guardar keys locales con turnos de hoy (para no perderlas)
-        const preservar={};
-        Object.keys(S.asgn||{}).forEach(function(k){
-          const arr=Array.isArray(S.asgn[k])?S.asgn[k]:[];
-          const conHoy=arr.filter(function(a){return turnosHoyIds.has(a.tid);});
-          if(conHoy.length) preservar[k]=arr;
-        });
-        // Tomar el asgn del servidor como base
-        const nuevo={};
-        Object.keys(d.asgn).forEach(function(k){
-          if(Array.isArray(d.asgn[k])) nuevo[k]=d.asgn[k];
-        });
-        // Superponer las keys locales preservadas (local gana para turnos de hoy)
-        Object.keys(preservar).forEach(function(k){ nuevo[k]=preservar[k]; });
-        S.asgn=nuevo;
-        _asgnDirtyKeys.clear();
-      }
-    }
-    if(d.lavAsgn && typeof d.lavAsgn==='object'){
-      if(Date.now()<=_lavAsgnDirtyUntil){
-        // Dirty activo — solo mezclar: el servidor aporta keys nuevas, pero
-        // NO se pisan las keys que el usuario está editando localmente.
-        Object.keys(d.lavAsgn).forEach(function(k){
-          if(!_lavAsgnDirtyKeys.has(k) && Array.isArray(d.lavAsgn[k])) S.lavAsgn[k]=d.lavAsgn[k];
-        });
-      } else {
-        // Dirty expiró: el servidor es la fuente de verdad PERO local gana para
-        // los turnos del día visible (mismo criterio que el planificador, que sí
-        // funciona). Esto evita que la asignación se revierta cuando el push aún
-        // no fue devuelto por el servidor.
-        const _idsHoy=new Set((getTurnosParaFecha(lavDate)||[]).map(function(t){return t.id;}));
-        const _domsHoy=new Set((getTurnosParaFecha(lavDate)||[]).map(function(t){return (t.dominio||'').toUpperCase();}));
-        const _pendientes={};
-        Object.keys(S.lavAsgn||{}).forEach(function(k){
-          const arr=Array.isArray(S.lavAsgn[k])?S.lavAsgn[k]:[];
-          const conHoy=arr.filter(function(a){
-            return _idsHoy.has(a.turnoId) || (a.dominio && _domsHoy.has(a.dominio.toUpperCase()));
-          });
-          if(conHoy.length) _pendientes[k]=arr;
-        });
-        const _nuevoLav={};
-        Object.keys(d.lavAsgn).forEach(function(k){ if(Array.isArray(d.lavAsgn[k])) _nuevoLav[k]=d.lavAsgn[k]; });
-        Object.keys(_pendientes).forEach(function(k){ _nuevoLav[k]=_pendientes[k]; });
-        S.lavAsgn=_nuevoLav;
-        _lavAsgnDirtyKeys.clear();
-      }
-    }
+    _mergeField('asgn',d.asgn,_t0);
+    _mergeField('lavAsgn',d.lavAsgn,_t0);
     if(d.notifs)     S.notifs=d.notifs;
     if(d.ausencias && Date.now()>_ausenciasDirtyUntil) S.ausencias=(typeof d.ausencias==='object'&&!Array.isArray(d.ausencias))?d.ausencias:{};
     if(d.config && typeof d.config==='object' && Date.now()>_configDirtyUntil){
@@ -1351,16 +1490,8 @@ async function syncNow(silent){
         }
       });
     }
-    // Asignaciones históricas por fecha (merge: no pisar el día activo si está dirty)
-    if(d.asgnHistory && typeof d.asgnHistory==='object'){
-      if(!S.asgnHistory) S.asgnHistory={};
-      const _fActiva=fechaActivaAsgn();
-      Object.keys(d.asgnHistory).forEach(function(fch){
-        // No sobreescribir el snapshot del día activo si hay cambios locales pendientes
-        if(fch===_fActiva && Date.now()<=_asgnDirtyUntil) return;
-        S.asgnHistory[fch]=d.asgnHistory[fch];
-      });
-    }
+    // Asignaciones históricas por fecha
+    _mergeField('asgnHistory',d.asgnHistory,_t0);
     if(d.paradas && Date.now()>_paradasDirtyUntil){
       S.paradas=(d.paradas||[]).map(function(p){
         return Object.assign({},p,{
@@ -1374,25 +1505,7 @@ async function syncNow(silent){
         });
       });
     }
-    if(d.finalizados && Array.isArray(d.finalizados)){
-      if(Date.now()>_finalizadosDirtyUntil){
-        // Servidor es la verdad. Se preservan solo los finalizados locales MUY recientes
-        // (últimos 20s) que podrían no haber confirmado su push todavía.
-        const _ahoraMs=Date.now();
-        const servIds=new Set(d.finalizados.map(function(f){return f.id;}));
-        const localesRecientes=(S.finalizados||[]).filter(function(f){
-          if(servIds.has(f.id)) return false; // ya está en servidor
-          // ¿Es reciente? parsear finAt
-          const ts=Date.parse((f.finAt||'').replace(' ','T'))||0;
-          return (_ahoraMs - ts) < 20000; // finalizado hace menos de 20s
-        });
-        // Deduplicar por id
-        const byId={};
-        d.finalizados.forEach(function(f){ if(f&&f.id) byId[f.id]=f; });
-        localesRecientes.forEach(function(f){ if(f&&f.id) byId[f.id]=f; });
-        S.finalizados=Object.keys(byId).map(function(k){return byId[k];});
-      }
-    }
+    _mergeField('finalizados',d.finalizados,_t0);
     if(d.lavFinalizados) S.lavFinalizados=d.lavFinalizados;
     if(d.turnos!==undefined && Date.now()>_turnosDirtyUntil){
       if(d.turnos.length>0){
@@ -1403,20 +1516,22 @@ async function syncNow(silent){
       }
     }
     saveL();setSd('ok');renderAll();checkNotifs();if(!silent)toast('✓ Sincronizado');
+    // Tras el primer sync ya se conoce la versión del servidor: enviar lo pendiente
+    if(_primerSync) flushPendientes();
   }catch(e){setSd('err', e.message||'Error de red');}
+  finally{ _syncBusy=false; }
 }
 
 async function push(action,payload){
   if(CFG.offline||!CFG.apiUrl)return;
+  const f=_ACTION_FIELD[action];
   try{
-    await fetchWithRetry(CFG.apiUrl,{method:'POST',redirect:'follow',body:JSON.stringify({action,payload}),headers:{'Content-Type':'text/plain'}});
+    if(f) await pushField(f);               // envía solo lo que cambió
+    else  await _postJSON({action,payload});
     setSd('ok');
   }catch(e){
+    // El cambio queda pendiente y se reintenta en el próximo sync
     setSd('err', e.message||'Error al guardar');
-    // Si falla guardar una asignación, extender su dirty para no perderla
-    // hasta que la conexión se recupere (el merge la conserva mientras tanto).
-    if(action==='updateAsgn') _asgnDirtyUntil=Date.now()+300000;
-    if(action==='updateLavAsgn') _lavAsgnDirtyUntil=Date.now()+300000;
   }
 }
 function setSd(s, detail){
@@ -3008,13 +3123,21 @@ function isTurnoAsignadoLav(turnoId, dominio){
   const dom=(dominio||'').toUpperCase();
   return Object.values(S.lavAsgn||{}).some(function(arr){
     return Array.isArray(arr)&&arr.some(function(a){
-      return a.turnoId===turnoId || (dom && (a.dominio||'').toUpperCase()===dom);
+      return a.turnoId===turnoId || (dom && (a.dominio||'').toUpperCase()===dom && _lavItemReciente(a));
     });
   });
 }
+// El match por patente solo vale para lavados de los últimos días (carry-over);
+// así un auto que vuelve por otro trabajo no queda escondido por un lavado viejo.
+function _lavItemReciente(a){
+  const ref=new Date((typeof lavDate!=='undefined'&&lavDate?lavDate:tod())+'T12:00:00').getTime();
+  const t=Date.parse(a&&a.at||'');
+  if(isNaN(t)) return true;
+  return t>=ref-5*86400000 && t<=ref+86400000;
+}
 function isTurnoLavado(turnoId, dominio){
   const dom=(dominio||'').toUpperCase();
-  return Object.values(S.lavAsgn||{}).some(function(arr){return Array.isArray(arr)&&arr.some(function(a){return (a.turnoId===turnoId || (dom && (a.dominio||'').toUpperCase()===dom))&&a.lavado;});});
+  return Object.values(S.lavAsgn||{}).some(function(arr){return Array.isArray(arr)&&arr.some(function(a){return (a.turnoId===turnoId || (dom && (a.dominio||'').toUpperCase()===dom && _lavItemReciente(a)))&&a.lavado;});});
 }
 function checkLavConflict(turnoId, lavSlot){
   // Devuelve {ok:false, msg:'...'} si hay conflicto con la planificación del taller
@@ -3980,15 +4103,15 @@ function renderStatsTrackeo(turnos, statsDate){
     <td style="${colStyle}">${esc((t.asesor||'').split(' ')[0])}</td>
     <td style="${colStyle}">${ev.turno||'—'}</td>
     <td style="${colStyle}">${ev.recepcion||(t.asistencia==='asistio'?'✓':'—')}</td>
-    <td style="${colStyle}background:#fef9ee;${cellClass(d1)}">${fmtMin(d1)}</td>
+    <td style="${colStyle}background:rgba(245,158,11,.12);${cellClass(d1)}">${fmtMin(d1)}</td>
     <td style="${colStyle}">${ev.plan||'—'}</td>
-    <td style="${colStyle}background:#fef9ee;${cellClass(d2)}">${fmtMin(d2)}</td>
+    <td style="${colStyle}background:rgba(245,158,11,.12);${cellClass(d2)}">${fmtMin(d2)}</td>
     <td style="${colStyle}">${ev.fin||'—'}</td>
-    <td style="${colStyle}background:#fef9ee;${cellClass(d3)}">${fmtMin(d3)}</td>
+    <td style="${colStyle}background:rgba(245,158,11,.12);${cellClass(d3)}">${fmtMin(d3)}</td>
     <td style="${colStyle}">${ev.lavfin||'—'}</td>
-    <td style="${colStyle}background:#fef9ee;${cellClass(d6)}">${fmtMin(d6)}</td>
+    <td style="${colStyle}background:rgba(245,158,11,.12);${cellClass(d6)}">${fmtMin(d6)}</td>
     <td style="${colStyle}">${ev.entrega||'—'}</td>
-    <td style="${colStyle}background:#f0fdf4;font-weight:700;${cellClass(total)}">${fmtMin(total)}</td>
+    <td style="${colStyle}background:rgba(34,197,94,.14);font-weight:700;${cellClass(total)}">${fmtMin(total)}</td>
   </tr>`).join('');
 
   const avgRow=`<tr style="background:var(--sur2);font-weight:700;">
@@ -4282,6 +4405,8 @@ async function confirmResetDB(){
   S.turnos=[];S.entregas=[];S.history=[];S.asgn={};S.notifs=[];
   S.paradas=[];S.finalizados=[];S.lavAsgn={};S.lavFinalizados=[];S.ausencias={};
   S.turnosFecha='';S.htmlCargado=false;
+  S.asgnHistory={};S._base={};
+  _syncPausaHasta=Date.now()+20000; // que el sync no traiga datos viejos mientras el servidor se limpia
   localStorage.removeItem('st2');
   // Bloquear sync 15s para que no restaure datos viejos
   _asgnDirtyUntil=Date.now()+60000;   _asgnDirtyKeys.clear();
@@ -4804,7 +4929,7 @@ function renderParadas(){
         <div style="font-size:11px;color:var(--tx2);margin-top:2px;">Motivo: ${esc(p.motivo||'—')}</div>
         <div style="font-size:11px;margin-top:4px;display:flex;gap:8px;flex-wrap:wrap;">
           <span style="color:var(--tx3);">Ingreso: ${fd(p.fechaIngreso)}</span>
-          <span style="color:var(--tx3);">Resolución: ${fd((p.fechaResolucion||'').split('T')[0])}</span>
+          <span style="color:var(--tx3);">Resolución: ${fd(p.fechaResolucion?fechaLocalISO(new Date(p.fechaResolucion)):'')}</span>
           <span style="font-weight:700;color:var(--ac);">Total: ${dias}d</span>
         </div>
         ${p.updates&&p.updates.length?`<div style="margin-top:6px;font-size:10px;color:var(--tx3);border-top:1px solid var(--bor);padding-top:4px;">${p.updates.length} novedad${p.updates.length>1?'es':''} registrada${p.updates.length>1?'s':''}</div>`:''}
@@ -4982,85 +5107,384 @@ function togglePassVis(){
 
 // ===== APPS SCRIPT =====
 const SCRIPT=`// ============================================================
-//  TALLER — Google Apps Script
-//  DQ + Sabattini — sin login, acceso libre
+//  TALLER — Google Apps Script (v2: guardado por parches, sin límite de celda)
 // ============================================================
 // 1. Crear un Google Sheet nuevo
 // 2. Copiar el ID de la URL y pegarlo en SHEET_ID
-// 3. Implementar → Nueva implementación → Aplicación web
-//    Ejecutar como: Yo | Acceso: Cualquier persona
-// 4. Copiar la URL /exec y pegarla en ⚙️ Configuración
-// ============================================================
-
+// 3. Extensiones → Apps Script → pegar este código → Implementar como aplicación web (acceso: cualquiera)
 const SHEET_ID = 'PEGAR_ID_DEL_SHEET_AQUI';
+const API_VERSION = 2;
+const CHUNK = 40000;          // límite por celda de Sheets = 50.000 caracteres
+const MARK  = '~';            // marca de "valor partido en trozos"
 
 function doGet(e) {
   try {
-    const ss = SpreadsheetApp.openById(SHEET_ID);
-    // Leer turnos del día desde Config
-    const turnosRaw = cell(ss, 'Config', 'turnosDelDia');
-    const turnosFecha = cell(ss, 'Config', 'turnosFecha') || '';
-    return j({
-      ok:          true,
-      turnos:      turnosRaw || [],
-      turnosFecha: turnosFecha,
-      paradas:     rows(ss, 'Paradas'),
-      finalizados: cell(ss, 'Config', 'finalizados') || [],
-      entregas:    cell(ss, 'Config', 'entregas') || [],
-      asgn:        cell(ss, 'Config', 'asgn'),
-      lavAsgn:     cell(ss, 'Config', 'lavAsgn'),
-      notifs:      cell(ss, 'Config', 'notifs')
-    });
+    const ss   = SpreadsheetApp.openById(SHEET_ID);
+    const full = e && e.parameter && e.parameter.full === '1';
+    const cfg  = readConfig(ss);
+    const out = {
+      ok:              true,
+      v:               API_VERSION,
+      turnos:          val(cfg, 'turnosDelDia', []),
+      turnosFecha:     val(cfg, 'turnosFecha', ''),
+      paradas:         rows(ss, 'Paradas'),
+      finalizados:     getFinalizados(ss, cfg),
+      entregas:        val(cfg, 'entregas', []),
+      asgn:            val(cfg, 'asgn', {}),
+      lavAsgn:         val(cfg, 'lavAsgn', {}),
+      notifs:          val(cfg, 'notifs', []),
+      config:          val(cfg, 'configData', null),
+      asgnHistory:     val(cfg, 'asgnHistory', {}),
+      historial:       getHistorial(ss),
+      turnosHistorial: getTurnosHistorial(ss, full ? 0 : 3),
+      ausencias:       val(cfg, 'ausencias', {})
+    };
+    // Si un dato no se pudo leer, no se manda (el cliente lo deja como está en vez de borrarlo)
+    Object.keys(out).forEach(function(k){ if (out[k] === undefined) delete out[k]; });
+    return j(out);
   } catch(err) {
     return j({ ok: false, msg: err.message });
   }
 }
 
 function doPost(e) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000); // un solo guardado a la vez: evita que dos PCs se pisen
+  } catch(err) {
+    return j({ ok: false, msg: 'Servidor ocupado, se reintentará' });
+  }
   try {
     const body    = JSON.parse(e.postData.contents);
     const action  = body.action;
     const payload = body.payload;
     const ss      = SpreadsheetApp.openById(SHEET_ID);
 
-    if      (action === 'saveTurnosDelDia') {
-      setCell(ss, 'Config', 'turnosDelDia', JSON.stringify(payload.turnos || []));
-      setCell(ss, 'Config', 'turnosFecha',  payload.fecha || '');
+    if      (action === 'patch')               patchField(ss, payload || {});
+    else if (action === 'saveTurnosDelDia') {
+      writeConfig(ss, 'turnosDelDia', JSON.stringify(payload.turnos || []));
+      writeConfig(ss, 'turnosFecha',  payload.fecha || '');
     }
-    else if (action === 'saveTurnos')      setCell(ss, 'Config', 'turnosDelDia', JSON.stringify(payload.turnos || []));
-    else if (action === 'updateAsgn')      setCell(ss, 'Config', 'asgn',         JSON.stringify(payload));
-    else if (action === 'updateLavAsgn')   setCell(ss, 'Config', 'lavAsgn',      JSON.stringify(payload));
-    else if (action === 'saveNotifs')      setCell(ss, 'Config', 'notifs',        JSON.stringify(payload));
-    else if (action === 'saveParada')      upsert(ss, 'Paradas',     payload);
-    else if (action === 'updateParada')    update(ss, 'Paradas',     payload.id, payload);
-    else if (action === 'deleteParada')    del(ss,    'Paradas',     payload.id);
-    else if (action === 'saveFinalizados') setCell(ss, 'Config', 'finalizados', JSON.stringify(payload));
-    else if (action === 'clearAll'){
-      // Reset completo — borrar todas las hojas y celdas de config
-      ['Finalizados','Entregas','Paradas','LavFinalizados'].forEach(function(name){
-        var sh=ss.getSheetByName(name);
-        if(sh&&sh.getLastRow()>1)sh.deleteRows(2,sh.getLastRow()-1);
+    else if (action === 'saveTurnos')          writeConfig(ss, 'turnosDelDia', JSON.stringify(payload.turnos || []));
+    else if (action === 'updateAsgn')          writeConfig(ss, 'asgn',         JSON.stringify(payload || {}));
+    else if (action === 'updateLavAsgn')       writeConfig(ss, 'lavAsgn',      JSON.stringify(payload || {}));
+    else if (action === 'saveNotifs')          writeConfig(ss, 'notifs',       JSON.stringify(payload || []));
+    else if (action === 'saveParada')          upsert(ss, 'Paradas', payload);
+    else if (action === 'updateParada')        update(ss, 'Paradas', payload.id, payload);
+    else if (action === 'deleteParada')        del(ss,    'Paradas', payload.id);
+    else if (action === 'saveFinalizados')     saveFinalizados(ss, payload);
+    else if (action === 'saveEntregas')        writeConfig(ss, 'entregas',     JSON.stringify(payload || []));
+    else if (action === 'saveAusencias')       writeConfig(ss, 'ausencias',    JSON.stringify(payload || {}));
+    else if (action === 'saveConfig')          writeConfig(ss, 'configData',   JSON.stringify(payload || {}));
+    else if (action === 'saveAsgnHistory')     writeConfig(ss, 'asgnHistory',  JSON.stringify(payload || {}));
+    else if (action === 'saveHistorial')       saveHistorial(ss, payload);
+    else if (action === 'saveTurnosHistorial') saveTurnosHistorial(ss, payload.date, payload.turnos);
+    else if (action === 'login')               { /* sin validación en servidor: mismo comportamiento que antes */ }
+    else if (action === 'clearAll') {
+      ['Paradas','Historial','TurnosHistorial','FinalizadosData'].forEach(function(name) {
+        var sh = ss.getSheetByName(name);
+        if (sh && sh.getLastRow() > 1) sh.deleteRows(2, sh.getLastRow() - 1);
       });
-      setCell(ss,'Config','turnosDelDia','[]');
-      setCell(ss,'Config','turnosFecha','');
-      setCell(ss,'Config','asgn','{}');
-      setCell(ss,'Config','lavAsgn','{}');
-      setCell(ss,'Config','notifs','[]');
-      setCell(ss,'Config','entregas','[]');
-      setCell(ss,'Config','finalizados','[]');
+      ['turnosDelDia','entregas','finalizados','historial','notifs'].forEach(function(k){ writeConfig(ss, k, '[]'); });
+      ['asgn','lavAsgn','asgnHistory','ausencias'].forEach(function(k){ writeConfig(ss, k, '{}'); });
+      writeConfig(ss, 'turnosFecha', '');
     }
-    else if (action === 'saveEntregas')    setCell(ss, 'Config', 'entregas', JSON.stringify(payload));
-
-    return j({ ok: true });
+    else {
+      return j({ ok: false, v: API_VERSION, msg: 'Acción desconocida: ' + action });
+    }
+    return j({ ok: true, v: API_VERSION });
   } catch(err) {
-    return j({ ok: false, msg: err.message });
+    return j({ ok: false, v: API_VERSION, msg: err.message });
+  } finally {
+    lock.releaseLock();
   }
 }
 
+// ── Parches: aplicar solo lo que cambió (asignaciones, lavadero, finalizados, entregas) ──
+
+function patchField(ss, p) {
+  const f = p.field;
+  if (f === 'asgn' || f === 'lavAsgn' || f === 'asgnHistory') {
+    const cfg = readConfig(ss);
+    var obj = val(cfg, f, {});
+    if (obj === undefined) throw new Error('No se pudo leer ' + f + ' (no se aplica el cambio)');
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) obj = {};
+    const set = p.set || {};
+    Object.keys(set).forEach(function(k){ obj[k] = set[k]; });
+    (p.del || []).forEach(function(k){ delete obj[k]; });
+    writeConfig(ss, f, JSON.stringify(obj));
+  }
+  else if (f === 'entregas') {
+    const cfg = readConfig(ss);
+    var arr = val(cfg, 'entregas', []);
+    if (arr === undefined) throw new Error('No se pudo leer entregas (no se aplica el cambio)');
+    if (!Array.isArray(arr)) arr = [];
+    const delIds = {}; (p.del || []).forEach(function(id){ delIds[String(id)] = true; });
+    const idx = {}; arr.forEach(function(x, i){ if (x && x.id != null) idx[String(x.id)] = i; });
+    (p.upsert || []).forEach(function(x){
+      if (!x || x.id == null) return;
+      const k = String(x.id);
+      if (idx[k] !== undefined) arr[idx[k]] = x; else { idx[k] = arr.length; arr.push(x); }
+    });
+    arr = arr.filter(function(x){ return !(x && delIds[String(x.id)]); });
+    writeConfig(ss, 'entregas', JSON.stringify(arr));
+  }
+  else if (f === 'finalizados') {
+    patchFinalizados(ss, p.upsert || [], p.del || []);
+  }
+  else throw new Error('Campo no permitido: ' + f);
+}
+
+// ── Config: clave/valor con valores grandes partidos en varias filas ──────────
+
+// Devuelve { clave: valorParseado }. Si un valor no se puede leer queda como undefined.
+function readConfig(ss) {
+  const sh = getOrCreate(ss, 'Config');
+  const data = sh.getDataRange().getValues();
+  const raw = {};
+  for (var i = 1; i < data.length; i++) {
+    var k = data[i][0];
+    if (k === '' || k === null) continue;
+    k = String(k);
+    if (raw[k] === undefined) raw[k] = data[i][1];
+  }
+  const out = {};
+  Object.keys(raw).forEach(function(k){
+    if (k.indexOf('#') >= 0) return; // trozo de otro valor
+    var v = raw[k];
+    if (typeof v === 'string' && v.charAt(0) === MARK) {
+      var s = v.slice(1), n = 1;
+      while (typeof raw[k + '#' + n] === 'string' && raw[k + '#' + n].charAt(0) === MARK) {
+        s += raw[k + '#' + n].slice(1); n++;
+      }
+      try { out[k] = JSON.parse(s); } catch(e) { out[k] = undefined; }
+      return;
+    }
+    if (typeof v === 'string') {
+      var t = v.trim();
+      if (t.charAt(0) === '{' || t.charAt(0) === '[') {
+        try { out[k] = JSON.parse(t); } catch(e) { out[k] = undefined; }
+        return;
+      }
+    }
+    out[k] = v;
+  });
+  return out;
+}
+
+// Valor de la config: el default si la clave no existe; undefined si existe pero está dañada
+function val(cfg, key, def) {
+  if (!Object.prototype.hasOwnProperty.call(cfg, key)) return def;
+  return cfg[key];
+}
+
+function writeConfig(ss, key, value) {
+  const sh = getOrCreate(ss, 'Config');
+  ensureHeaders(sh, ['key', 'value']);
+  value = (value === null || value === undefined) ? '' : value;
+  var parts;
+  if (typeof value === 'string' && value.length > CHUNK) {
+    parts = [];
+    for (var p = 0; p < value.length; p += CHUNK) parts.push(MARK + value.slice(p, p + CHUNK));
+  } else {
+    parts = [value];
+  }
+  const data = sh.getDataRange().getValues();
+  const rowOf = {};
+  for (var i = 1; i < data.length; i++) {
+    var k = String(data[i][0]);
+    if (k && rowOf[k] === undefined) rowOf[k] = i + 1;
+  }
+  // 1) escribir trozos (primero los nuevos, al final el principal) para que una lectura
+  //    simultánea nunca vea una mezcla válida de viejo y nuevo
+  for (var n = parts.length - 1; n >= 0; n--) {
+    var name = n === 0 ? key : key + '#' + n;
+    if (rowOf[name]) sh.getRange(rowOf[name], 2).setValue(parts[n]);
+    else { sh.appendRow([name, parts[n]]); rowOf[name] = sh.getLastRow(); }
+  }
+  // 2) borrar trozos sobrantes de un valor anterior más largo
+  const sobran = [];
+  Object.keys(rowOf).forEach(function(name){
+    var m = name.indexOf(key + '#') === 0 ? Number(name.slice(key.length + 1)) : NaN;
+    if (!isNaN(m) && m >= parts.length) sobran.push(rowOf[name]);
+  });
+  sobran.sort(function(a, b){ return b - a; }).forEach(function(r){ sh.deleteRow(r); });
+}
+
+// Compatibilidad con código viejo
+function cell(ss, sheetName, key) {
+  if (sheetName === 'Config') { const v = readConfig(ss)[key]; return v === undefined ? null : v; }
+  const sh = getOrCreate(ss, sheetName);
+  const data = sh.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === key) { try { return JSON.parse(data[i][1]); } catch(e) { return data[i][1]; } }
+  }
+  return null;
+}
+function setCell(ss, sheetName, key, value) {
+  if (sheetName === 'Config') return writeConfig(ss, key, value);
+  const sh = getOrCreate(ss, sheetName);
+  ensureHeaders(sh, ['key', 'value']);
+  const data = sh.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === key) { sh.getRange(i + 1, 2).setValue(value); return; }
+  }
+  sh.appendRow([key, value]);
+}
+
+// ── Finalizados (hoja dedicada, una fila por auto) ───────────────────────────
+
+function getFinalizados(ss, cfg) {
+  const sh = getOrCreate(ss, 'FinalizadosData');
+  const data = sh.getDataRange().getValues();
+  const result = [];
+  for (var i = 1; i < data.length; i++) {
+    if (!data[i][0]) continue;
+    try { result.push(JSON.parse(data[i][2])); } catch(e) {}
+  }
+  if (result.length) return result;
+  // Hoja vacía (todavía no migrada): usar la celda vieja de Config
+  const viejos = cfg ? val(cfg, 'finalizados', []) : [];
+  return Array.isArray(viejos) ? viejos : (viejos === undefined ? undefined : []);
+}
+
+function saveFinalizados(ss, arr) {
+  // Reemplazo completo (clientes viejos): escribir encima y recién después recortar sobrantes
+  const sh = getOrCreate(ss, 'FinalizadosData');
+  arr = Array.isArray(arr) ? arr : [];
+  const rowsOut = [['id','dominio','json']];
+  arr.forEach(function(f){ if (f && f.id) rowsOut.push([String(f.id), f.dominio || '', JSON.stringify(f)]); });
+  sh.getRange(1, 1, rowsOut.length, 3).setValues(rowsOut);
+  const last = sh.getLastRow();
+  if (last > rowsOut.length) sh.deleteRows(rowsOut.length + 1, last - rowsOut.length);
+}
+
+function patchFinalizados(ss, upserts, dels) {
+  const sh = getOrCreate(ss, 'FinalizadosData');
+  if (sh.getLastRow() === 0) sh.appendRow(['id','dominio','json']);
+  // Primera vez con hoja vacía: traer los de la celda vieja para no perderlos
+  if (sh.getLastRow() < 2) {
+    const viejos = val(readConfig(ss), 'finalizados', []);
+    if (Array.isArray(viejos) && viejos.length) saveFinalizados(ss, viejos);
+  }
+  const data = sh.getDataRange().getValues();
+  const rowOf = {};
+  for (var i = 1; i < data.length; i++) if (data[i][0]) rowOf[String(data[i][0])] = i + 1;
+  const nuevos = [];
+  upserts.forEach(function(f){
+    if (!f || f.id == null) return;
+    const id = String(f.id), fila = [id, f.dominio || '', JSON.stringify(f)];
+    if (rowOf[id]) sh.getRange(rowOf[id], 1, 1, 3).setValues([fila]);
+    else nuevos.push(fila);
+  });
+  if (nuevos.length) sh.getRange(sh.getLastRow() + 1, 1, nuevos.length, 3).setValues(nuevos);
+  dels.map(function(id){ return rowOf[String(id)]; }).filter(Boolean)
+      .sort(function(a, b){ return b - a; })
+      .forEach(function(r){ sh.deleteRow(r); });
+}
+
+// ── Historial (metadatos: date + count) ───────────────────────────────────
+
+function getHistorial(ss) {
+  const sh = getOrCreate(ss, 'Historial');
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) return [];
+  return data.slice(1).map(function(row) {
+    return { date: parseDateCell(row[0]) || '', count: Number(row[1]) || 0 };
+  }).filter(function(h) { return !!h.date; });
+}
+
+function saveHistorial(ss, entries) {
+  const sh = getOrCreate(ss, 'Historial');
+  var byDate = {};
+  // Unir con lo que ya hay: una PC con historial incompleto no borra días de otra
+  getHistorial(ss).forEach(function(h){ byDate[h.date] = h.count; });
+  (entries || []).forEach(function(entry) {
+    if (!entry || !entry.date || String(entry.date).length !== 10) return;
+    var d = String(entry.date), c = Number(entry.count) || 0;
+    if (!byDate[d] || c > byDate[d]) byDate[d] = c;
+  });
+  var deduped = Object.keys(byDate).sort().map(function(d) { return [d, byDate[d]]; });
+  if (!deduped.length) return;
+  var rowsOut = [['date', 'count']].concat(deduped);
+  sh.getRange(1, 1, rowsOut.length, 2).setValues(rowsOut);
+  const last = sh.getLastRow();
+  if (last > rowsOut.length) sh.deleteRows(rowsOut.length + 1, last - rowsOut.length);
+}
+
+// ── TurnosHistorial (turnos completos por día; días grandes en varias columnas) ──
+
+function parseDateCell(val) {
+  var date = '';
+  try {
+    var dt = new Date(val);
+    if (!isNaN(dt.getTime())) date = Utilities.formatDate(dt, 'America/Argentina/Buenos_Aires', 'yyyy-MM-dd');
+  } catch(e) {}
+  if (!date) date = String(val).slice(0, 10);
+  return (date && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(date)) ? date : null;
+}
+
+function leerJsonFila(row) {
+  var b = row[1];
+  if (typeof b === 'string' && b.charAt(0) === MARK) {
+    var s = '';
+    for (var c = 1; c < row.length && typeof row[c] === 'string' && row[c].charAt(0) === MARK; c++) s += row[c].slice(1);
+    return JSON.parse(s);
+  }
+  return JSON.parse(b);
+}
+
+// ultimosDias = 0 → todos; si no, solo los N días más recientes (sync liviano)
+function getTurnosHistorial(ss, ultimosDias) {
+  const sh = getOrCreate(ss, 'TurnosHistorial');
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) return {};
+  var result = {};
+  data.slice(1).forEach(function(row) {
+    var date = parseDateCell(row[0]);
+    if (!date) return;
+    try {
+      var turnos = leerJsonFila(row);
+      if (!result[date] || turnos.length > result[date].length) result[date] = turnos;
+    } catch(e) {}
+  });
+  if (ultimosDias > 0) {
+    var dates = Object.keys(result).sort().slice(-ultimosDias), parcial = {};
+    dates.forEach(function(d){ parcial[d] = result[d]; });
+    return parcial;
+  }
+  return result;
+}
+
+function saveTurnosHistorial(ss, date, turnos) {
+  if (!date || date.length !== 10) return;
+  const sh = getOrCreate(ss, 'TurnosHistorial');
+  ensureHeaders(sh, ['date', 'turnos']);
+  const json = JSON.stringify(turnos || []);
+  var parts = [json];
+  if (json.length > CHUNK) {
+    parts = [];
+    for (var p = 0; p < json.length; p += CHUNK) parts.push(MARK + json.slice(p, p + CHUNK));
+  }
+  const data = sh.getDataRange().getValues();
+  var firstRow = -1, toDelete = [];
+  for (var i = 1; i < data.length; i++) {
+    if (parseDateCell(data[i][0]) === date) {
+      if (firstRow === -1) firstRow = i + 1; else toDelete.push(i + 1);
+    }
+  }
+  for (var k = toDelete.length - 1; k >= 0; k--) sh.deleteRow(toDelete[k]);
+  if (firstRow < 0) { sh.appendRow([date]); firstRow = sh.getLastRow(); }
+  const ancho = Math.max(sh.getLastColumn(), parts.length + 1);
+  const fila = [date].concat(parts);
+  while (fila.length < ancho) fila.push('');
+  sh.getRange(firstRow, 1, 1, fila.length).setValues([fila]);
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
 function j(obj) {
-  return ContentService
-    .createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON);
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
 }
 
 function rows(ss, sheetName) {
@@ -5075,68 +5499,35 @@ function rows(ss, sheetName) {
   });
 }
 
-function cell(ss, sheetName, key) {
-  const sh = getOrCreate(ss, sheetName);
-  const data = sh.getDataRange().getValues();
-  for (var i = 1; i < data.length; i++) {
-    if (data[i][0] === key) {
-      try { return JSON.parse(data[i][1]); } catch(e) { return data[i][1]; }
-    }
-  }
-  return null;
-}
-
-function setCell(ss, sheetName, key, value) {
-  const sh = getOrCreate(ss, sheetName);
-  ensureHeaders(sh, ['key', 'value']);
-  const data = sh.getDataRange().getValues();
-  for (var i = 1; i < data.length; i++) {
-    if (data[i][0] === key) {
-      sh.getRange(i + 1, 2).setValue(value);
-      return;
-    }
-  }
-  sh.appendRow([key, value]);
-}
-
 function upsert(ss, sheetName, obj) {
   const sh = getOrCreate(ss, sheetName);
-  const keys = Object.keys(obj);
-  ensureHeaders(sh, keys);
+  ensureHeaders(sh, Object.keys(obj));
   const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
   const data = sh.getDataRange().getValues();
   const idCol = headers.indexOf('id');
   if (idCol >= 0) {
     for (var i = 1; i < data.length; i++) {
       if (String(data[i][idCol]) === String(obj.id)) {
-        const row = headers.map(function(h) {
-          const v = obj[h];
-          return v !== undefined ? (typeof v === 'object' ? JSON.stringify(v) : v) : data[i][headers.indexOf(h)];
-        });
-        sh.getRange(i + 1, 1, 1, row.length).setValues([row]);
+        sh.getRange(i+1,1,1,headers.length).setValues([headers.map(function(h){
+          const v=obj[h]; return v!==undefined?(typeof v==='object'?JSON.stringify(v):v):data[i][headers.indexOf(h)];
+        })]);
         return;
       }
     }
   }
-  sh.appendRow(headers.map(function(h) {
-    const v = obj[h];
-    return v !== undefined ? (typeof v === 'object' ? JSON.stringify(v) : v) : '';
-  }));
+  sh.appendRow(headers.map(function(h){const v=obj[h];return v!==undefined?(typeof v==='object'?JSON.stringify(v):v):''}));
 }
 
 function update(ss, sheetName, id, fields) {
   const sh = getOrCreate(ss, sheetName);
-  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
   const data = sh.getDataRange().getValues();
   const idCol = headers.indexOf('id');
   if (idCol < 0) return;
   for (var i = 1; i < data.length; i++) {
     if (String(data[i][idCol]) === String(id)) {
-      headers.forEach(function(h, colIdx) {
-        if (fields[h] !== undefined) {
-          const v = fields[h];
-          sh.getRange(i + 1, colIdx + 1).setValue(typeof v === 'object' ? JSON.stringify(v) : v);
-        }
+      headers.forEach(function(h, c) {
+        if (fields[h]!==undefined) sh.getRange(i+1,c+1).setValue(typeof fields[h]==='object'?JSON.stringify(fields[h]):fields[h]);
       });
       return;
     }
@@ -5146,11 +5537,10 @@ function update(ss, sheetName, id, fields) {
 function del(ss, sheetName, id) {
   const sh = getOrCreate(ss, sheetName);
   const data = sh.getDataRange().getValues();
-  const headers = data[0];
-  const idCol = headers.indexOf('id');
+  const idCol = data[0].indexOf('id');
   if (idCol < 0) return;
-  for (var i = data.length - 1; i >= 1; i--) {
-    if (String(data[i][idCol]) === String(id)) { sh.deleteRow(i + 1); return; }
+  for (var i = data.length-1; i >= 1; i--) {
+    if (String(data[i][idCol]) === String(id)) { sh.deleteRow(i+1); return; }
   }
 }
 
@@ -5160,7 +5550,31 @@ function getOrCreate(ss, name) {
 
 function ensureHeaders(sh, keys) {
   if (sh.getLastRow() === 0) sh.appendRow(keys);
-}`
+}
+
+// ===== DIAGNÓSTICO (ejecutar desde el editor si hace falta) =====
+// Muestra el tamaño de cada dato guardado en Config (para detectar el límite de 50.000)
+function diagnosticoTamanos() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const data = getOrCreate(ss, 'Config').getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) Logger.log(data[i][0] + ': ' + String(data[i][1]).length + ' caracteres');
+  Logger.log('Finalizados en hoja: ' + Math.max(0, getOrCreate(ss, 'FinalizadosData').getLastRow() - 1));
+}
+
+// ===== MIGRACIÓN (ejecutar UNA vez desde el editor) =====
+function migrarFinalizados() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const viejos = val(readConfig(ss), 'finalizados', []) || [];
+  Logger.log('Finalizados en celda vieja: ' + viejos.length);
+  if (!Array.isArray(viejos) || !viejos.length) { Logger.log('Nada que migrar.'); return; }
+  const porId = {};
+  getFinalizados(ss, null).forEach(function(f){ if (f && f.id) porId[f.id] = f; });
+  viejos.forEach(function(f){ if (f && f.id && !porId[f.id]) porId[f.id] = f; });
+  const combinados = Object.keys(porId).map(function(k){ return porId[k]; });
+  saveFinalizados(ss, combinados);
+  Logger.log('Migrados. Total en hoja nueva: ' + combinados.length);
+}
+`
 function copyScript(){navigator.clipboard.writeText(SCRIPT).then(()=>toast('✓ Código copiado')).catch(()=>{const ta=document.createElement('textarea');ta.value=SCRIPT;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);toast('✓ Código copiado');});}
 
 // ===== AUTH — Apps Script backend =====
