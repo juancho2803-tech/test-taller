@@ -910,6 +910,14 @@ code{font-family:monospace;background:var(--bg);padding:1px 4px;border-radius:3p
       <div class="ct" style="margin-bottom:10px;">&#9201; Trackeo de tiempos por instancia</div>
       <div id="stats-trackeo" style="overflow-x:auto;"></div>
     </div>
+    <div style="margin-top:18px;">
+      <div class="ct" style="margin-bottom:10px;">&#128336; Horas planificadas por técnico</div>
+      <div id="stats-horas-tec" style="overflow-x:auto;"></div>
+    </div>
+    <div style="margin-top:18px;">
+      <div class="ct" style="margin-bottom:10px;">&#128197; Días guardados</div>
+      <div id="stats-dias-guardados" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+    </div>
   </div>
 </div>
 
@@ -1277,10 +1285,13 @@ function _h(s){ // hash FNV-1a 32 bits + largo
   return (h>>>0).toString(36)+':'+s.length;
 }
 function _isList(f){return Object.prototype.hasOwnProperty.call(SYNC_LIST_FIELDS,f);}
+function _normEntrega(e){
+  return Object.assign({estado:'pendiente',obs:'',entregadoAt:''},e,{estado:e.estado||'pendiente'});
+}
 function _asMap(f,val){
   if(_isList(f)){
     const m={};
-    (Array.isArray(val)?val:[]).forEach(function(x){ if(x&&x.id!=null) m[x.id]=x; });
+    (Array.isArray(val)?val:[]).forEach(function(x){ if(x&&x.id!=null) m[x.id]=(f==='entregas'?_normEntrega(x):x); });
     return m;
   }
   return (val&&typeof val==='object'&&!Array.isArray(val))?val:{};
@@ -1401,7 +1412,7 @@ function pushField(f){
     try{ await _pushFieldOnce(f); }
     finally{
       const again=st.again; _flushing[f]=null;
-      if(again) pushField(f);
+      if(again) pushField(f).catch(function(e){ setSd('err', e.message||'Error al guardar'); });
     }
   })();
   _flushing[f]=st;
@@ -1411,6 +1422,89 @@ function pushField(f){
 async function flushPendientes(){
   for(const f of SYNC_FIELDS){
     try{ await pushField(f); }catch(e){ setSd('err',e.message||'Error al guardar'); }
+  }
+  try{ await pushTurnos(false); }catch(e){ setSd('err',e.message||'Error al guardar'); }
+}
+
+// ── Turnos del día: misma idea (base + parches por id de turno) ──
+// S._baseTurnos={fecha, h:{id:hash}} = lo último visto en el servidor.
+// Cambiar de día (cargar turnero) reemplaza la lista completa; el resto
+// (asistencia, express, turno manual…) viaja como parche y no pisa a otra PC.
+let _turnosAckAt=0;
+let _turnosFlush=null;
+function _turnosMap(arr){const m={};(Array.isArray(arr)?arr:[]).forEach(function(t){if(t&&t.id!=null)m[t.id]=t;});return m;}
+function _turnosPend(){
+  const b=S._baseTurnos;
+  if(!b||!b.h||b.fecha!==(S.turnosFecha||'').substring(0,10)) return null;
+  const loc=_turnosMap(S.turnos), set={}, del=[];
+  Object.keys(loc).forEach(function(k){ if(b.h[k]!==_h(JSON.stringify(loc[k]))) set[k]=loc[k]; });
+  Object.keys(b.h).forEach(function(k){ if(!Object.prototype.hasOwnProperty.call(loc,k)) del.push(k); });
+  return {set:set,del:del,n:Object.keys(set).length+del.length};
+}
+async function _pushTurnosOnce(full){
+  if(CFG.offline||!CFG.apiUrl) return;
+  const fecha=(S.turnosFecha||'').substring(0,10)||tod();
+  const p=_turnosPend();
+  if(!full && !S._turnosFullPend && p && _srvV2===true){
+    if(!p.n) return;
+    const sent=JSON.parse(JSON.stringify(p.set));
+    const d=await _postJSON({action:'patch',payload:{field:'turnos',fecha:fecha,upsert:Object.keys(sent).map(function(k){return sent[k];}),del:p.del}});
+    if(!(d&&d.v>=2)){ _srvV2=false; return _pushTurnosOnce(true); }
+    Object.keys(sent).forEach(function(k){ S._baseTurnos.h[k]=_h(JSON.stringify(sent[k])); });
+    p.del.forEach(function(k){ delete S._baseTurnos.h[k]; });
+    _turnosAckAt=Date.now(); saveL();
+    return;
+  }
+  if(!full && !S._turnosFullPend && !p) return; // nada que mandar todavía (se espera el primer sync)
+  if(!full && !S._turnosFullPend && p && !p.n) return;
+  const sent=JSON.parse(JSON.stringify(S.turnos||[]));
+  S._turnosFullPend=true;
+  await _postJSON({action:'saveTurnosDelDia',payload:{fecha:fecha,turnos:sent}});
+  S._baseTurnos={fecha:fecha,h:_hashMap(_turnosMap(sent))};
+  S._turnosFullPend=false; _turnosAckAt=Date.now(); saveL();
+}
+function pushTurnos(full){
+  if(_turnosFlush){ _turnosFlush.again=true; _turnosFlush.full=_turnosFlush.full||full; return _turnosFlush.p; }
+  const st={again:false,full:false};
+  st.p=(async function(){
+    try{ await _pushTurnosOnce(full); }
+    finally{
+      const again=st.again, f2=st.full; _turnosFlush=null;
+      if(again) pushTurnos(f2).catch(function(e){ setSd('err', e.message||'Error al guardar'); });
+    }
+  })();
+  _turnosFlush=st;
+  return st.p;
+}
+// Recibir turnos del servidor: mismo día → servidor + mis cambios pendientes; otro día → el del servidor
+function _recibirTurnos(d,t0){
+  if(d.turnos===undefined||!Array.isArray(d.turnos)) return;
+  if(_turnosAckAt>=t0 || _turnosFlush || S._turnosFullPend) return; // respuesta vieja o envío en curso
+  const srvF=d.turnosFecha?String(d.turnosFecha).substring(0,10):'';
+  const srvT=d.turnos.map(function(t){delete t.tel;delete t.mail;return t;});
+  const b=S._baseTurnos, loc=(S.turnosFecha||'').substring(0,10);
+  if(b && b.h && b.fecha===srvF && loc===srvF){
+    const p=_turnosPend();
+    const out=[], vistos=new Set();
+    srvT.forEach(function(t){
+      if(!t||t.id==null) return;
+      vistos.add(String(t.id));
+      if(p.del.indexOf(String(t.id))>=0) return;
+      out.push(Object.prototype.hasOwnProperty.call(p.set,t.id)?p.set[t.id]:t);
+    });
+    Object.keys(p.set).forEach(function(k){ if(!vistos.has(String(k))) out.push(p.set[k]); });
+    S._baseTurnos={fecha:srvF,h:_hashMap(_turnosMap(srvT))};
+    S.turnos=out;
+    return;
+  }
+  if(b && Date.now()<_turnosDirtyUntil && loc && srvF!==loc) return;
+  if(srvT.length>0){
+    S.turnos=srvT;
+    if(srvF) S.turnosFecha=srvF;
+    S._baseTurnos={fecha:(S.turnosFecha||'').substring(0,10),h:_hashMap(_turnosMap(srvT))};
+  } else if(!S.htmlCargado){
+    S.turnos=[];S.turnosFecha='';
+    S._baseTurnos={fecha:'',h:{}};
   }
 }
 
@@ -1438,9 +1532,6 @@ async function syncNow(silent){
     _srvV2=!!(d.v>=2);
     if(Array.isArray(d.entregas)){
       _mergeField('entregas',d.entregas,_t0);
-      S.entregas=(S.entregas||[]).map(function(e){
-        return Object.assign({estado:'pendiente',obs:'',entregadoAt:''},e,{estado:e.estado||'pendiente'});
-      });
     }
     _mergeField('asgn',d.asgn,_t0);
     _mergeField('lavAsgn',d.lavAsgn,_t0);
@@ -1485,6 +1576,10 @@ async function syncNow(silent){
         const turnos=d.turnosHistorial[date]||[];
         if(snap){
           if(!snap.turnos||!snap.turnos.length) snap.turnos=turnos;
+          else if(date!==(S.turnosFecha||'').substring(0,10)){
+            const ids=new Set(snap.turnos.map(function(t){return t.id;}));
+            turnos.forEach(function(t){ if(t&&t.id&&!ids.has(t.id)) snap.turnos.push(t); });
+          }
         } else if(turnos.length){
           S.history.push({date:date,count:turnos.length,turnos:turnos});
         }
@@ -1507,14 +1602,7 @@ async function syncNow(silent){
     }
     _mergeField('finalizados',d.finalizados,_t0);
     if(d.lavFinalizados) S.lavFinalizados=d.lavFinalizados;
-    if(d.turnos!==undefined && Date.now()>_turnosDirtyUntil){
-      if(d.turnos.length>0){
-        S.turnos=d.turnos.map(function(t){delete t.tel;delete t.mail;return t;});
-        if(d.turnosFecha) S.turnosFecha=d.turnosFecha.substring(0,10);
-      } else if(!S.htmlCargado){
-        S.turnos=[];S.turnosFecha='';
-      }
-    }
+    _recibirTurnos(d,_t0);
     saveL();setSd('ok');renderAll();checkNotifs();if(!silent)toast('✓ Sincronizado');
     // Tras el primer sync ya se conoce la versión del servidor: enviar lo pendiente
     if(_primerSync) flushPendientes();
@@ -1526,7 +1614,11 @@ async function push(action,payload){
   if(CFG.offline||!CFG.apiUrl)return;
   const f=_ACTION_FIELD[action];
   try{
-    if(f) await pushField(f);               // envía solo lo que cambió
+    if(action==='saveTurnosDelDia'){       // parche por turno, o lista completa si cambió el día
+      const _full=!!(payload&&payload.full)||!S._baseTurnos||S._baseTurnos.fecha!==(S.turnosFecha||'').substring(0,10);
+      await pushTurnos(_full);
+    }
+    else if(f) await pushField(f);          // envía solo lo que cambió
     else  await _postJSON({action,payload});
     setSd('ok');
   }catch(e){
@@ -1595,15 +1687,16 @@ function calcularCarryOver(nuevoDk, parsed){
   const prev=candidatos[0];
   result.prevDate=prev.date;
   const prevTurnoIds=new Set(prev.turnos.map(function(t){return t.id;}));
-  const finDominios=new Set((S.finalizados||[]).map(function(f){return (f.dominio||'').toUpperCase();}));
-  // Recorrer S.asgn buscando asignaciones de turnos del día anterior NO finalizados
-  Object.keys(S.asgn||{}).forEach(function(key){
-    const arr=Array.isArray(S.asgn[key])?S.asgn[key]:[];
+  const _asgnPrev=getAsgnParaFecha(prev.date);
+  // Recorrer las asignaciones del día anterior buscando trabajos NO finalizados
+  Object.keys(_asgnPrev||{}).forEach(function(key){
+    const arr=Array.isArray(_asgnPrev[key])?_asgnPrev[key]:[];
     arr.forEach(function(a){
-      const t=prev.turnos.find(function(x){return x.id===a.tid;});
+      const t=prev.turnos.find(function(x){return x.id===a.tid;})
+        ||(a.dominio?prev.turnos.find(function(x){return (x.dominio||'').toUpperCase()===a.dominio.toUpperCase();}):null);
       if(!t) return;
-      // ¿Está finalizado? (por dominio, ya que los finalizados se identifican así)
-      if(finDominios.has((t.dominio||'').toUpperCase())) return;
+      // ¿Está finalizado ESTE trabajo? (no cuenta un finalizado de una visita anterior del auto)
+      if(esFinalizado(t, prev.date)) return;
       // Es un pendiente: clonar el turno marcándolo como carry-over
       const clon=Object.assign({}, t, {carryOver:true, carryFrom:prev.date});
       if(!result.turnos.find(function(x){return x.id===clon.id;})){
@@ -1611,8 +1704,8 @@ function calcularCarryOver(nuevoDk, parsed){
       }
       // Preservar su asignación (mismo técnico, misma franja, mismo span)
       if(!result.asgn[key]) result.asgn[key]=[];
-      if(!result.asgn[key].find(function(x){return x.tid===a.tid;})){
-        result.asgn[key].push(Object.assign({}, a));
+      if(!result.asgn[key].find(function(x){return x.tid===t.id;})){
+        result.asgn[key].push(Object.assign({}, a, {tid:t.id, dominio:a.dominio||t.dominio||''}));
       }
     });
   });
@@ -1642,50 +1735,100 @@ function aplicarCarryOverEntregas(nuevoDk, prevDate){
   });
 }
 
+// Campos que vienen del archivo del turnero (lo demás es trabajo del usuario: asistencia, express, etc.)
+const _CAMPOS_TURNERO=['marca','dominio','modelo','hora','asesor','cargoPor','cliente','servicio','req','estadoR','chasis','contacto','ingresado','suc'];
+// Deja activo el día dk con los turnos dados SIN perder lo ya trabajado de ese día:
+//  - un auto que ya estaba conserva su id (sus tarjetas siguen) y sus marcas;
+//  - se conservan turnos manuales, con asistencia, planificados o finalizados que no vengan en el archivo;
+//  - los pendientes del día anterior se suman sin pisar tarjetas de la misma franja.
+// agregar=true: se agregan los turnos a los existentes (turno manual).
+function aplicarTurnosDia(dk, nuevos, agregar){
+  guardarAsgnSnapshot();
+  const _activa=S.turnosFecha?S.turnosFecha.substring(0,10):'';
+  // El día que se deja guarda TODOS sus turnos (manuales y pendientes incluidos)
+  if(_activa && _activa!==dk && S.turnos.length){
+    const hv=S.history.find(function(x){return x.date===_activa;});
+    const copia=S.turnos.map(function(t){return Object.assign({},t);});
+    if(hv){hv.turnos=copia; if(!hv.count) hv.count=copia.length;}
+    else S.history.push({date:_activa,count:copia.length,turnos:copia});
+    push('saveTurnosHistorial',{date:_activa,turnos:copia});
+  }
+  const _hdk=S.history.find(function(x){return x.date===dk;});
+  const existentes=(_activa===dk?S.turnos:((_hdk&&_hdk.turnos)||[])).map(function(t){return Object.assign({},t);});
+  const asgnDia={};
+  const _src=getAsgnParaFecha(dk);
+  Object.keys(_src||{}).forEach(function(k){ if(Array.isArray(_src[k])) asgnDia[k]=_src[k].map(function(a){return Object.assign({},a);}); });
+  const _U=function(s){return String(s||'').toUpperCase();};
+  const tidsAsg=new Set(); Object.values(asgnDia).forEach(function(arr){arr.forEach(function(a){tidsAsg.add(a.tid);});});
+  const porDom={}; existentes.forEach(function(t){ const d=_U(t.dominio); if(d&&!porDom[d]) porDom[d]=t; });
+  const usados=new Set(), finales=[], vistos=new Set();
+  nuevos.forEach(function(t){
+    const d=_U(t.dominio);
+    if(d&&vistos.has(d)) return; if(d) vistos.add(d);
+    const old=d?porDom[d]:null;
+    if(old && !agregar){
+      usados.add(old);
+      const m=Object.assign({},old);
+      _CAMPOS_TURNERO.forEach(function(c){ if(t[c]!==undefined) m[c]=t[c]; });
+      finales.push(m);
+    } else if(!old) finales.push(t);
+  });
+  existentes.forEach(function(t){
+    if(usados.has(t)) return;
+    const d=_U(t.dominio);
+    if(d&&finales.some(function(x){return _U(x.dominio)===d;})) return;
+    if(agregar || t.manual || t.asistencia==='asistio' || tidsAsg.has(t.id) || esFinalizado(t,dk)) finales.push(t);
+  });
+  // Pendientes del día anterior
+  const co=calcularCarryOver(dk, finales);
+  const carry=co.turnos.filter(function(t){return !finales.some(function(x){return _U(x.dominio)===_U(t.dominio);});});
+  S.turnos=finales.concat(carry);
+  S.htmlCargado=true;
+  S.turnosFecha=dk;
+  _turnosDirtyUntil=Date.now()+60000;
+  // Asignaciones: las del día + las de pendientes (se suman, nunca se pisan)
+  Object.keys(co.asgn).forEach(function(k){
+    if(!asgnDia[k]) asgnDia[k]=[];
+    co.asgn[k].forEach(function(a){ if(!asgnDia[k].some(function(x){return x.tid===a.tid;})) asgnDia[k].push(Object.assign({},a)); });
+  });
+  // Re-vincular por patente las tarjetas cuyo id de turno cambió; las de autos que ya no están se quitan
+  const ids=new Set(S.turnos.map(function(t){return t.id;}));
+  const domDeId={}; existentes.concat(nuevos).forEach(function(t){ if(t&&t.id) domDeId[t.id]=_U(t.dominio); });
+  const yaPuesto=new Set(), nuevoAsgn={};
+  Object.keys(asgnDia).forEach(function(k){
+    asgnDia[k].forEach(function(a){
+      let tid=a.tid;
+      if(!ids.has(tid)){
+        const d=_U(a.dominio)||domDeId[tid]||'';
+        const t=d?S.turnos.find(function(x){return _U(x.dominio)===d;}):null;
+        if(!t) return;
+        tid=t.id;
+      }
+      if(yaPuesto.has(tid)) return; yaPuesto.add(tid);
+      (nuevoAsgn[k]=nuevoAsgn[k]||[]).push(Object.assign({},a,{tid:tid}));
+    });
+  });
+  S.asgn=nuevoAsgn;
+  const copia=S.turnos.map(function(t){return Object.assign({},t);});
+  if(_hdk){_hdk.turnos=copia;_hdk.count=agregar?Math.max(_hdk.count||0,copia.length):nuevos.length;}
+  else S.history.push({date:dk,count:agregar?copia.length:nuevos.length,turnos:copia});
+  return {co:co, carry:carry};
+}
 function confirmarCargaHTML(parsed){
   const dateEl=document.getElementById('fecha-carga-inp');
   const dk=dateEl?dateEl.value||tod():tod();
   const modal=document.getElementById('fecha-carga-modal');
   if(modal)modal.remove();
-  // Guardar snapshot de asignaciones del día que estaba activo antes de cambiar
-  guardarAsgnSnapshot();
-  const prev=S.history.find(function(h){return h.date===dk;});
-  if(prev&&prev.turnos){
-    parsed.forEach(function(t){
-      const old=prev.turnos.find(function(o){return o.dominio===t.dominio;});
-      if(old){t.express=old.express||false;t.asistencia=old.asistencia||'pendiente';}
-    });
-  }
-  // ===== CARRY-OVER: traer pendientes del día anterior =====
-  // Detectar turnos asignados y NO finalizados del día que estaba cargado
-  const _co=calcularCarryOver(dk, parsed);
-  // Combinar: turnos nuevos + carry-over (sin duplicar dominios)
-  const _parsedDominios=new Set(parsed.map(function(t){return (t.dominio||'').toUpperCase();}));
-  const _carryTurnos=_co.turnos.filter(function(t){return !_parsedDominios.has((t.dominio||'').toUpperCase());});
-  S.turnos=parsed.concat(_carryTurnos);
-  S.htmlCargado=true;
-  S.turnosFecha=dk;
-  _turnosDirtyUntil=Date.now()+60000;
-  // Reconstruir S.asgn: mantener solo asignaciones de turnos que existen hoy (nuevos o carry-over)
-  const _newTurnoIds=new Set(S.turnos.map(function(t){return t.id;}));
-  // Preservar las asignaciones de carry-over que calculamos
-  Object.keys(_co.asgn).forEach(function(k){
-    S.asgn[k]=_co.asgn[k];
-  });
-  Object.keys(S.asgn).forEach(function(k){
-    S.asgn[k]=(Array.isArray(S.asgn[k])?S.asgn[k]:[]).filter(function(a){return _newTurnoIds.has(a.tid);});
-    if(!S.asgn[k].length) delete S.asgn[k];
-  });
+  const _r=aplicarTurnosDia(dk, parsed, false);
+  const _co=_r.co, _carryTurnos=_r.carry;
   // Carry-over de lavadero y entregas
   aplicarCarryOverLavadero(dk, _co.prevDate);
   aplicarCarryOverEntregas(dk, _co.prevDate);
   _asgnDirtyUntil=Date.now()+60000;
   _asgnDirtyKeys.clear();
   if(_carryTurnos.length) setTimeout(function(){toast('↪ '+_carryTurnos.length+' pendiente(s) del día anterior');},800);
-  if(prev){prev.count=parsed.length;prev.turnos=parsed.map(function(t){return Object.assign({},t);});}
-  else S.history.push({date:dk,count:parsed.length,turnos:parsed.map(function(t){return Object.assign({},t);})});
   saveL();
-  push('saveTurnosDelDia',{fecha:dk,turnos:S.turnos});
+  push('saveTurnosDelDia',{fecha:dk,turnos:S.turnos,full:true});
   _historialDirtyUntil=Date.now()+30000;
   // Guardar turnos del día en su propia celda
   push('saveTurnosHistorial',{date:dk, turnos:(S.history.find(function(h){return h.date===dk;})||{}).turnos||[]});
@@ -1796,6 +1939,23 @@ function getAsgnParaFecha(fecha){
   if(S.asgnHistory && S.asgnHistory[f]) return S.asgnHistory[f];
   return {}; // sin datos para ese día
 }
+// Asignaciones EDITABLES de una fecha: el día activo es S.asgn; otro día, su snapshot.
+// (Antes todo se escribía en S.asgn aunque se estuviera viendo otro día → la tarjeta "desaparecía")
+function asgnDe(fecha){
+  const f=(fecha||'').substring(0,10)||fechaActivaAsgn();
+  if(f===fechaActivaAsgn()){ if(!S.asgn||typeof S.asgn!=='object') S.asgn={}; return S.asgn; }
+  if(!S.asgnHistory||typeof S.asgnHistory!=='object') S.asgnHistory={};
+  if(!S.asgnHistory[f]||typeof S.asgnHistory[f]!=='object') S.asgnHistory[f]={};
+  return S.asgnHistory[f];
+}
+function guardarAsgnDe(fecha){
+  const f=(fecha||'').substring(0,10)||fechaActivaAsgn();
+  const A=asgnDe(f);
+  Object.keys(A).forEach(function(k){ if(!Array.isArray(A[k])||!A[k].length) delete A[k]; });
+  saveL();
+  if(f===fechaActivaAsgn()) push('updateAsgn',S.asgn);
+  else push('saveAsgnHistory',S.asgnHistory);
+}
 
 function filteredTPlan(){
   let d=getTurnosParaFecha(planDate);
@@ -1833,22 +1993,28 @@ function filteredParadas(){
   if(sucFil==='all')return S.paradas;
   return S.paradas.filter(p=>p.suc===sucFil);
 }
+// ¿Ese finalizado ya tiene entrega? (vinculada, o del mismo auto con fecha igual o posterior)
+function _finEntregado(f){
+  const fDay=(f.finAt||'').slice(0,10);
+  return (S.entregas||[]).some(function(e){
+    return e.finalizadoId===f.id || (e.dominio && e.dominio===f.dominio && (e.fecha||'')>=fDay);
+  });
+}
 function filteredFins(){
   // Autos finalizados disponibles para entregar:
-  // - Los finalizados el día consultado (edDate), MÁS
-  // - Los finalizados en días anteriores o iguales a edDate que aún NO fueron entregados
-  //   (un auto listo sigue disponible hasta que se entrega, no desaparece al día siguiente)
-  const yaEntregados=new Set(S.entregas.filter(e=>e.finalizadoId).map(e=>e.finalizadoId));
+  // - los finalizados el día consultado (edDate), y
+  // - los de los últimos 14 días que todavía no tienen entrega
+  const desde=fechaLocalISO(new Date(new Date(edDate+'T12:00:00').getTime()-14*86400000));
   let base=S.finalizados.filter(function(f){
     const fDay=(f.finAt||'').slice(0,10);
     if(!fDay) return false;
-    if(fDay===edDate) return true;            // finalizado ese día
-    if(fDay<edDate && !yaEntregados.has(f.id)) return true; // pendiente de entregar de días previos
-    return false;
+    if(fDay===edDate) return true;
+    return fDay<edDate && fDay>=desde && !_finEntregado(f);
   });
   if(sucFil==='all')return base;
   return base.filter(f=>f.suc===sucFil);
 }
+
 
 // ===== HISTORY DATE NAVIGATION =====
 function goToday(){
@@ -2444,7 +2610,7 @@ function renderPlan(){
   // KPI cards: autos trabajando (asignados en la grilla), nuevos ingresos, carry-over
   const turnosHoy=getTurnosParaFecha(planDate);
   const asignados=new Set();
-  Object.values(S.asgn||{}).forEach(function(arr){
+  Object.values(getAsgnParaFecha(planDate)).forEach(function(arr){
     (Array.isArray(arr)?arr:[]).forEach(function(a){asignados.add(a.tid);});
   });
   const trabajando=turnosHoy.filter(t=>asignados.has(t.id)).length;
@@ -2460,7 +2626,7 @@ function renderPlan(){
 }
 function renderSidebar(){
   const turnosPlanDate=new Set(filteredTPlan().map(t=>t.id));
-  const assigned=new Set(Object.values(S.asgn).flat().map(a=>a.tid).filter(tid=>turnosPlanDate.has(tid)));
+  const assigned=new Set(Object.values(getAsgnParaFecha(planDate)).flat().map(a=>a.tid).filter(tid=>turnosPlanDate.has(tid)));
   const _pq=getSearchQ('plan-search');
   let pending=filteredTPlan().filter(t=>!assigned.has(t.id)&&matchSearch(t,_pq));
   if(planAsesorFil!=='all') pending=pending.filter(t=>t.asesor===planAsesorFil);
@@ -2719,10 +2885,30 @@ function _updateGridCells(g, allTechs){
   });
 }
 
+// Reparte en carriles las tarjetas de un técnico que se superponen en el tiempo
+// (dos autos en la misma franja ya no quedan uno exactamente encima del otro).
+function _carrilesTecnico(asgnDia, tech){
+  const items=[];
+  SLOTS.forEach(function(h,i){
+    (asgnDia[tech+'_'+h]||[]).forEach(function(a){ if(a&&a.tid) items.push({tid:a.tid,s:i,e:i+Math.max(1,a.span||1)}); });
+  });
+  items.sort(function(x,y){return x.s-y.s||(x.tid<y.tid?-1:1);});
+  const out={}; let grupo=[], fin=-1, carriles=[];
+  function cerrar(){ const n=carriles.length||1; grupo.forEach(function(g){out[g.tid]={l:g.l,n:n};}); grupo=[]; carriles=[]; }
+  items.forEach(function(it){
+    if(it.s>=fin && grupo.length) cerrar();
+    let l=carriles.findIndex(function(e){return e<=it.s;});
+    if(l<0){ l=carriles.length; carriles.push(it.e); } else carriles[l]=it.e;
+    it.l=l; grupo.push(it); fin=Math.max(fin,it.e);
+  });
+  if(grupo.length) cerrar();
+  return out;
+}
 function _fillCell(cell, tech, hora){
   var key=tech+'_'+hora;
   const turnosDelDia=getTurnosParaFecha(planDate);
   const asgnDia=getAsgnParaFecha(planDate); // asignaciones del día visualizado
+  const _lanes=_carrilesTecnico(asgnDia, tech);
   (asgnDia[key]||[]).forEach(function(a){
     let t=turnosDelDia.find(function(x){return x.id===a.tid;});
     // Resolver dominio de la asignación para matchear entre snapshots
@@ -2736,16 +2922,20 @@ function _fillCell(cell, tech, hora){
       t=turnosDelDia.find(function(x){return (x.dominio||'').toUpperCase()===_domAsg.toUpperCase();});
     }
     if(!t)return; // turno no es de este día, no mostrar
-    const isFin=esFinalizado(t)||!!S.finalizados.find(function(f){return f.turnoId===a.tid;});
-    // Si es un carry-over (pendiente de ayer) que YA fue finalizado, no mostrarlo
-    if(t.carryOver && isFin) return;
+    const _fin=finalizadoDe(t,planDate)||(S.finalizados||[]).find(function(f){return f.turnoId===a.tid;})||null;
+    const isFin=!!_fin;
+    // Pendiente de un día anterior que se finalizó en un día ANTERIOR a este: ya no corresponde mostrarlo.
+    // Si se finalizó hoy (o después) queda visible en verde.
+    if(t.carryOver && _fin && _finDiaDe(_fin)<planDate) return;
+    const _ln=_lanes[a.tid]||{l:0,n:1};
     const tcol=colorTurno(t);
     const blk=document.createElement('div');
     const span=a.span||1; // cantidad de horas que ocupa
     const ROW_H=64;
     const modCls=t.prioritario?' blk-prior':t.rr?' blk-rr':'';
     blk.className='plan-blk stretched '+(isFin?'blk-fin':t.suc==='sab'?'sab-blk':'dq-blk')+(tcol?' '+tcol:'')+modCls;
-    blk.style.cssText='top:2px;height:'+(ROW_H*span-4)+'px;cursor:grab;';
+    blk.style.cssText='top:2px;height:'+(ROW_H*span-4)+'px;cursor:grab;'
+      +(_ln.n>1?'left:calc('+(_ln.l*100/_ln.n).toFixed(3)+'% + 2px);width:calc('+(100/_ln.n).toFixed(3)+'% - 4px);right:auto;':'');
     blk.draggable=true;
     blk.addEventListener('dragstart',function(e){
       e.stopPropagation();
@@ -2848,11 +3038,12 @@ function _fillCell(cell, tech, hora){
           const dy=e.clientY-startY;
           const newSpan=Math.max(1,Math.min(SLOTS.length,currentSpan+Math.round(dy/ROW_H)));
           // Guardar el span en S.asgn
-          const arr=S.asgn[k]||[];
+          const _A=asgnDe(planDate);
+          const arr=_A[k]||[];
           const idx=arr.findIndex(function(x){return x.tid===tid2;});
-          if(idx>=0){arr[idx].span=newSpan;S.asgn[k]=arr;}
+          if(idx>=0){arr[idx].span=newSpan;_A[k]=arr;}
           _asgnDirtyUntil=Date.now()+60000;
-          saveL();push('updateAsgn',S.asgn);
+          guardarAsgnDe(planDate);
           setTimeout(function(){renderPlan();},50);
         }
         document.addEventListener('mousemove',onMove);
@@ -2888,32 +3079,33 @@ function dropCell(hora,techname){
     drag=null;dragFromKey=null;return;
   }
   const key=techname+'_'+hora;
+  const _A=asgnDe(planDate);
 
   // Si viene arrastrando desde la grilla → mover sin modal
   if(dragFromKey && dragFromKey!==key){
-    const srcArr=S.asgn[dragFromKey]||[];
+    const srcArr=_A[dragFromKey]||[];
     const item=srcArr.find(function(a){return a.tid===tid;});
     if(item){
       // Quitar del origen
-      S.asgn[dragFromKey]=srcArr.filter(function(a){return a.tid!==tid;});
-      if(!S.asgn[dragFromKey].length) delete S.asgn[dragFromKey];
+      _A[dragFromKey]=srcArr.filter(function(a){return a.tid!==tid;});
+      if(!_A[dragFromKey].length) delete _A[dragFromKey];
       // Agregar al destino conservando span y datos
-      if(!S.asgn[key]) S.asgn[key]=[];
-      if(!S.asgn[key].find(function(a){return a.tid===tid;})){
-        S.asgn[key].push(Object.assign({},item));
+      if(!_A[key]) _A[key]=[];
+      if(!_A[key].find(function(a){return a.tid===tid;})){
+        _A[key].push(Object.assign({},item));
       }
       drag=null; dragFromKey=null;
       _asgnDirtyUntil=Date.now()+60000;
       _asgnDirtyKeys.add(key);
       _asgnDirtyKeys.add(dragFromKey||'');
-      saveL(); push('updateAsgn',S.asgn); renderPlan();
+      guardarAsgnDe(planDate); renderPlan();
       return;
     }
   }
 
   // Drop normal desde sidebar
-  if(!S.asgn[key])S.asgn[key]=[];
-  if(S.asgn[key].find(function(a){return a.tid===tid;})){drag=null;dragFromKey=null;return;}
+  if(!_A[key])_A[key]=[];
+  if(_A[key].find(function(a){return a.tid===tid;})){drag=null;dragFromKey=null;return;}
   // Marcar key como dirty ANTES de abrir modal para proteger del sync
   _asgnDirtyUntil=Date.now()+120000;
   _asgnDirtyKeys.add(key);
@@ -2921,7 +3113,9 @@ function dropCell(hora,techname){
   openEstimModal(tid,key);
 }
 
+let _estimFecha=null; // día en que se soltó la tarjeta (por si cambia la vista con el modal abierto)
 function openEstimModal(tid,key){
+  _estimFecha=planDate;
   const existing=document.getElementById('estim-modal');
   if(existing)existing.remove();
   const overlay=document.createElement('div');
@@ -2953,10 +3147,13 @@ function confirmEstim(tid,key,minutes){
   const span=Math.max(1,Math.round(minutes/SLOT_MINUTES));
   _asgnDirtyUntil=Date.now()+60000;
   _asgnDirtyKeys.add(key);
-  if(!S.asgn[key])S.asgn[key]=[];
-  const _tAsg=getTurnosParaFecha(planDate).find(function(x){return x.id===tid;});
-  S.asgn[key].push({tid:tid,dominio:(_tAsg&&_tAsg.dominio)||'',at:new Date().toISOString(),asignadoAt:(function(){const n=new Date();return n.toLocaleDateString('es-AR',{day:'2-digit',month:'2-digit'})+' '+n.toLocaleTimeString('es-AR',{hour:'2-digit',minute:'2-digit'});})(),span:span,estMin:minutes});
-  saveL();push('updateAsgn',S.asgn);
+  const _f=_estimFecha||planDate; _estimFecha=null;
+  const _A=asgnDe(_f);
+  if(!_A[key])_A[key]=[];
+  if(_A[key].find(function(a){return a.tid===tid;})) return;
+  const _tAsg=getTurnosParaFecha(_f).find(function(x){return x.id===tid;});
+  _A[key].push({tid:tid,dominio:(_tAsg&&_tAsg.dominio)||'',at:new Date().toISOString(),asignadoAt:(function(){const n=new Date();return n.toLocaleDateString('es-AR',{day:'2-digit',month:'2-digit'})+' '+n.toLocaleTimeString('es-AR',{hour:'2-digit',minute:'2-digit'});})(),span:span,estMin:minutes});
+  guardarAsgnDe(_f);
   setTimeout(function(){renderPlan();toast('✓ Asignado — '+minutes+' min');},50);
 }
 
@@ -2985,15 +3182,15 @@ function openCmtInput(key,tid,wrap,current){
   function saveCmt(){
     const val=inp.value.trim();
     // Guardar en asgn
-    const arr=S.asgn[key]||[];
+    const _f=planDate, _A=asgnDe(_f);
+    const arr=_A[key]||[];
     const item=arr.find(function(a){return a.tid===tid;});
     if(item){
       item.comentario=val;
-      S.asgn[key]=arr;
+      _A[key]=arr;
       _asgnDirtyUntil=Date.now()+60000;
       _asgnDirtyKeys.add(key);
-      saveL();
-      push('updateAsgn',S.asgn);
+      guardarAsgnDe(_f);
     }
     renderPlan();
   }
@@ -3055,29 +3252,44 @@ function toggleAusMenu(btn, tech){
 
 function rmAsgn(key,tid,e){
   e.stopPropagation();
-  S.asgn[key]=(S.asgn[key]||[]).filter(function(a){return a.tid!==tid;});
+  const _A=asgnDe(planDate);
+  _A[key]=(_A[key]||[]).filter(function(a){return a.tid!==tid;});
+  if(!_A[key].length) delete _A[key];
   _asgnDirtyUntil=Date.now()+60000;
   _asgnDirtyKeys.add(key);
-  saveL();push('updateAsgn',S.asgn);
+  guardarAsgnDe(planDate);
   setTimeout(function(){renderPlan();},50);
 }
 function addTech(){toast('Técnicos fijos — usá los filtros de sucursal');}
 function delTech(i){toast('Técnicos fijos — no se pueden eliminar');}
 
-function esFinalizado(turno){
-  if(!turno) return false;
+// Día del planificador en que se marcó (finDia); los viejos usan la fecha real (finAt).
+function _finDiaDe(f){ return String((f&&(f.finDia||f.finAt))||'').substring(0,10); }
+// Finalizado que corresponde a ESTE trabajo: mismo turno, o misma patente marcada
+// desde el día del turno (o desde el día en que quedó pendiente) en adelante.
+// Así un auto que vuelve semanas después no aparece como ya terminado.
+function finalizadoDe(turno, fecha){
+  if(!turno) return null;
+  const fins=S.finalizados||[];
+  const porId=fins.find(function(f){return f.turnoId===turno.id;});
+  if(porId) return porId;
   const dom=(turno.dominio||'').toUpperCase();
-  const tid=turno.id;
-  return (S.finalizados||[]).some(function(f){
-    return f.turnoId===tid || (dom && (f.dominio||'').toUpperCase()===dom);
-  });
+  if(!dom) return null;
+  const desde=String(turno.carryFrom||fecha||'').substring(0,10);
+  return fins.find(function(f){
+    return (f.dominio||'').toUpperCase()===dom && (!desde || _finDiaDe(f)>=desde);
+  })||null;
+}
+function esFinalizado(turno, fecha){
+  return !!finalizadoDe(turno, fecha||(typeof planDate!=='undefined'&&planDate)||tod());
 }
 
 function marcarFinalizado(turnoId, evt){
   evt&&evt.stopPropagation();
-  const t=S.turnos.find(x=>x.id===turnoId);if(!t)return;
-  // Evitar duplicados
-  if(S.finalizados.some(f=>f.turnoId===turnoId||(t.dominio&&(f.dominio||'').toUpperCase()===(t.dominio||'').toUpperCase()))){toast('Ya está marcado como finalizado');return;}
+  const _dia=(typeof planDate!=='undefined'&&planDate)||tod();
+  const t=getTurnosParaFecha(_dia).find(x=>x.id===turnoId)||S.turnos.find(x=>x.id===turnoId);if(!t)return;
+  // Evitar duplicados (solo de este mismo trabajo, no de visitas anteriores del auto)
+  if(finalizadoDe(t,_dia)){toast('Ya está marcado como finalizado');return;}
   const _ahora=new Date();
   const fin={
     id:'fin_'+Date.now(),
@@ -3089,6 +3301,7 @@ function marcarFinalizado(turnoId, evt){
     marca:t.marca||'',
     suc:t.suc||'dq',
     servicio:t.servicio||t.req||'',
+    finDia:_dia,
     finAt:fechaLocalISO(_ahora)+'T'+String(_ahora.getHours()).padStart(2,'0')+':'+String(_ahora.getMinutes()).padStart(2,'0')+':'+String(_ahora.getSeconds()).padStart(2,'0'),
     finAtStr:_ahora.toLocaleDateString('es-AR',{day:'2-digit',month:'2-digit',year:'numeric'})+' '+_ahora.toLocaleTimeString('es-AR',{hour:'2-digit',minute:'2-digit'})
   };
@@ -3148,7 +3361,7 @@ function checkLavConflict(turnoId, lavSlot){
 
   // Buscar si este turno está asignado en el planificador
   let planSlot=null, planSpan=1;
-  Object.entries(S.asgn||{}).forEach(function([k,arr]){
+  Object.entries(getAsgnParaFecha(lavDate)).forEach(function([k,arr]){
     (Array.isArray(arr)?arr:[]).forEach(function(a){
       if(a.tid===turnoId){
         const parts=k.split('_');
@@ -3164,14 +3377,13 @@ function checkLavConflict(turnoId, lavSlot){
   const planDurMin = planSpan * 30; // cada slot = 30min
   const planEnd = planMin + planDurMin;
 
-  // Hay conflicto si el lavado empieza antes de que termine la reparación
-  if(lavMin < planEnd){
-    const libre=planEnd;
-    const hh=String(Math.floor(libre/60)).padStart(2,'0');
-    const mm=String(libre%60).padStart(2,'0');
+  // Conflicto solo si el lavado se superpone con la reparación
+  if(lavMin < planEnd && lavEnd > planMin){
+    const hh=String(Math.floor(planEnd/60)).padStart(2,'0');
+    const mm=String(planEnd%60).padStart(2,'0');
     return {
       ok:false,
-      msg:`⚠ Conflicto: reparación hasta las ${hh}:${mm} (${planDurMin}min). El lavado no puede empezar antes.`
+      msg:`⚠ Conflicto: reparación de ${planSlot} a ${hh}:${mm}. El lavado no puede coincidir con ese horario.`
     };
   }
   return {ok:true};
@@ -3475,7 +3687,7 @@ function renderSemaforo(){
 function asignarEntregaDesdeSlot(asesor, slot){
   // Abrir modal de nueva entrega pre-cargado con asesor y slot
   // Si hay un auto seleccionado en sidebar usarlo, sino abrir modal general
-  const fins=S.finalizados.filter(f=>!S.entregas.find(e=>e.dominio===f.dominio&&e.fecha===edDate));
+  const fins=filteredFins().filter(f=>!_finEntregado(f));
   if(fins.length===0){toast('No hay autos listos para entregar');return;}
   if(fins.length===1){
     // Asignar directamente
@@ -3484,7 +3696,7 @@ function asignarEntregaDesdeSlot(asesor, slot){
     const e={id:'e_'+Date.now(),turnoId:f.turnoId,dominio:f.dominio,patente:f.dominio,
       modelo:t.modelo||f.modelo||'',cliente:t.cliente||f.cliente||'',
       asesor:t.asesor||asesor,asesorGrid:asesor,fecha:edDate,hora:slot,
-      estado:'pendiente',obs:'',at:new Date().toISOString()};
+      estado:'pendiente',obs:'',finalizadoId:f.id,at:new Date().toISOString()};
     S.entregas.push(e);
     _entregasDirtyUntil=Date.now()+20000;
     saveL();push('saveEntregas',S.entregas);
@@ -3501,7 +3713,7 @@ function openAsignarSlotModal(asesor, slot, fins){
   const overlay=document.createElement('div');
   overlay.id='slot-modal';
   overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:2000;display:flex;align-items:center;justify-content:center;';
-  const opts=fins.map(f=>`<button onclick="confirmarSlot('${f.dominio}','${esc(asesor)}','${slot}')"
+  const opts=fins.map(f=>`<button onclick="confirmarSlot('${f.id}','${esc(asesor)}','${slot}')"
     style="display:block;width:100%;padding:8px 12px;margin-bottom:4px;border-radius:8px;border:1px solid var(--bor);background:var(--bg);color:var(--tx);cursor:pointer;text-align:left;font-size:12px;">
     <b>${esc(f.dominio)}</b> ${esc(f.modelo||'')} — ${esc(f.cliente||'')}
   </button>`).join('');
@@ -3515,14 +3727,15 @@ function openAsignarSlotModal(asesor, slot, fins){
   overlay.addEventListener('click',e=>{if(e.target===overlay)overlay.remove();});
 }
 
-function confirmarSlot(dominio, asesor, slot){
+function confirmarSlot(finId, asesor, slot){
   document.getElementById('slot-modal')?.remove();
-  const f=S.finalizados.find(x=>x.dominio===dominio);if(!f)return;
+  const f=S.finalizados.find(x=>x.id===finId)||S.finalizados.find(x=>x.dominio===finId);if(!f)return;
+  const dominio=f.dominio;
   const t=S.turnos.find(x=>x.dominio===dominio)||{};
   const e={id:'e_'+Date.now(),turnoId:f.turnoId,dominio:f.dominio,patente:f.dominio,
     modelo:t.modelo||f.modelo||'',cliente:t.cliente||f.cliente||'',
     asesor:t.asesor||asesor,asesorGrid:asesor,fecha:edDate,hora:slot,
-    estado:'pendiente',obs:'',at:new Date().toISOString()};
+    estado:'pendiente',obs:'',finalizadoId:f.id,at:new Date().toISOString()};
   S.entregas.push(e);
   _entregasDirtyUntil=Date.now()+20000;
   saveL();push('saveEntregas',S.entregas);
@@ -3546,8 +3759,7 @@ function renderEnt(){
 }
 
 function renderFinSidebar(){
-  const yaEntregados=new Set(S.entregas.filter(e=>e.finalizadoId).map(e=>e.finalizadoId));
-  let pending=filteredFins().filter(f=>!yaEntregados.has(f.id));
+  let pending=filteredFins().filter(f=>!_finEntregado(f));
   // Filtrar por express/asistencia usando el turno origen
   if(entExpressFil||entAsistFil){
     const turnosMap=new Map(getTurnosParaFecha(edDate).map(t=>[t.id,t]));
@@ -3831,11 +4043,11 @@ function renderHist(){
     if(t.recepcionAt) ev.recepcion={hora:t.recepcionAt};
     else if(t.asistencia==='asistio') ev.recepcion={hora:'✓'};
     // Planificado
-    Object.values(S.asgn||{}).flat().forEach(a=>{
+    Object.values(getAsgnParaFecha(histDate)).flat().forEach(a=>{
       if(a.tid===t.id && a.asignadoAt) ev.plan={hora:fmtHist(a.asignadoAt)};
     });
     // Finalizado reparación
-    const fin=S.finalizados.find(f=>f.turnoId===t.id||(t.dominio&&(f.dominio||'').toUpperCase()===(t.dominio||'').toUpperCase()));
+    const fin=finalizadoDe(t,histDate);
     if(fin) ev.fin={hora:fin.finAtStr||fmtHist(fin.finAt)};
     // Lavado asignado y finalizado
     Object.values(S.lavAsgn||{}).flat().forEach(a=>{
@@ -3957,8 +4169,8 @@ function renderNotifs(){
     </div>`).join('');
 }
 function toggleNotif(){document.getElementById('npanel').classList.toggle('open');}
-function markRead(id){const n=S.notifs.find(x=>x.id===id);if(n)n.read=true;saveL();renderNotifs();}
-function clearNotifs(){S.notifs=[];saveL();renderNotifs();document.getElementById('npanel').classList.remove('open');}
+function markRead(id){const n=S.notifs.find(x=>x.id===id);if(n)n.read=true;saveL();push('saveNotifs',S.notifs);renderNotifs();}
+function clearNotifs(){S.notifs=[];saveL();push('saveNotifs',S.notifs);renderNotifs();document.getElementById('npanel').classList.remove('open');}
 
 // ===== STATS =====
 function statsDateNav(dir){
@@ -4007,11 +4219,63 @@ function renderStats(){
 
   const as={};tAll.forEach(t=>{if(t.asesor)as[t.asesor]=(as[t.asesor]||0)+1;});barC('ca',as,8);
   const ma={};tAll.forEach(t=>{if(t.marca)ma[t.marca]=(ma[t.marca]||0)+1;});barC('cm',ma);
-  const te={};getTechs(sucFil).forEach(function(n){let c=0;SLOTS.forEach(function(sl){(S.asgn[n+'_'+sl]||[]).forEach(function(a){const t=turnosDelDia.find(function(x){return x.id===a.tid;});if(!t)return;if(sucFil!=='all'&&t.suc!==sucFil)return;c++;});});if(c>0)te[n.split(' ')[0]]=c;});barC('cte',te);
+  const _asgnStats=getAsgnParaFecha(statsDate);
+  const te={};getTechs(sucFil).forEach(function(n){let c=0;SLOTS.forEach(function(sl){(_asgnStats[n+'_'+sl]||[]).forEach(function(a){const t=turnosDelDia.find(function(x){return x.id===a.tid;});if(!t)return;if(sucFil!=='all'&&t.suc!==sucFil)return;c++;});});if(c>0)te[n.split(' ')[0]]=c;});barC('cte',te);
   const ea={};eAll.forEach(e=>{if(e.asesor)ea[e.asesor]=(ea[e.asesor]||0)+1;});barC('cea',ea,8);
 
+  // ===== HORAS PLANIFICADAS POR TÉCNICO =====
+  renderStatsHorasTec(turnosDelDia, statsDate);
   // ===== TRACKEO DE TIEMPOS =====
   renderStatsTrackeo(tAll, statsDate);
+  renderStatsDiasGuardados(statsDate);
+}
+
+// Jornada: 8:30 a 17:45 con 1 h de descanso = 8 h 15 min
+const JORNADA_MIN=495;
+function renderStatsHorasTec(turnosDelDia, statsDate){
+  const el=document.getElementById('stats-horas-tec');if(!el)return;
+  const asg=getAsgnParaFecha(statsDate);
+  const filas=getTechs(sucFil).map(function(tech){
+    let min=0,n=0;
+    SLOTS.forEach(function(sl){
+      (asg[tech+'_'+sl]||[]).forEach(function(a){
+        let t=turnosDelDia.find(function(x){return x.id===a.tid;});
+        if(!t&&a.dominio) t=turnosDelDia.find(function(x){return (x.dominio||'').toUpperCase()===a.dominio.toUpperCase();});
+        if(!t) return;
+        if(sucFil!=='all'&&t.suc!==sucFil) return;
+        min+=(a.span||1)*SLOT_MINUTES; n++;
+      });
+    });
+    return {tech:tech,min:min,n:n};
+  }).sort(function(a,b){return b.min-a.min;});
+  const fmtH=function(m){const h=Math.floor(m/60),r=m%60;return h+'h'+(r?' '+r+'m':'');};
+  el.innerHTML='<table style="width:100%;border-collapse:collapse;font-size:12px;">'
+    +'<thead><tr style="border-bottom:2px solid var(--bor);color:var(--tx2);">'
+    +'<th style="text-align:left;padding:6px 10px;">Técnico</th><th style="padding:6px 10px;">Trabajos</th>'
+    +'<th style="text-align:right;padding:6px 10px;">Horas</th><th style="padding:6px 10px;min-width:180px;">Carga</th></tr></thead><tbody>'
+    +filas.map(function(r){
+      const pct=Math.round(r.min/JORNADA_MIN*100);
+      const col=pct>=100?'#dc2626':pct>=75?'#f59e0b':'#16a34a';
+      return '<tr style="border-bottom:1px solid var(--bor);">'
+        +'<td style="padding:7px 10px;font-weight:600;color:var(--tx);">'+esc(r.tech)+'</td>'
+        +'<td style="text-align:center;padding:7px 10px;color:var(--tx2);">'+r.n+'</td>'
+        +'<td style="text-align:right;padding:7px 10px;font-weight:700;color:var(--tx);">'+fmtH(r.min)+'</td>'
+        +'<td style="padding:7px 10px;"><div style="display:flex;align-items:center;gap:6px;">'
+        +'<div style="flex:1;background:var(--bor);border-radius:4px;height:8px;overflow:hidden;"><div style="width:'+Math.min(pct,100)+'%;height:100%;background:'+col+';"></div></div>'
+        +'<span style="font-size:11px;color:var(--tx2);min-width:34px;text-align:right;">'+pct+'%</span></div></td></tr>';
+    }).join('')
+    +'</tbody></table><div style="font-size:10px;color:var(--tx2);margin-top:6px;">Jornada 8:30–17:45 con 1 h de descanso = 8 h 15 m. Rojo ≥100%, amarillo ≥75%.</div>';
+}
+function renderStatsDiasGuardados(statsDate){
+  const el=document.getElementById('stats-dias-guardados');if(!el)return;
+  const dias=(S.history||[]).filter(function(h){return h.date;}).slice().sort(function(a,b){return b.date.localeCompare(a.date);});
+  if(!dias.length){el.innerHTML='<span style="font-size:12px;color:var(--tx2);">Sin días guardados aún.</span>';return;}
+  el.innerHTML=dias.map(function(h){
+    const act=h.date===statsDate;
+    const lbl=new Date(h.date+'T12:00:00').toLocaleDateString('es-AR',{weekday:'short',day:'numeric',month:'short'});
+    return '<button onclick="document.getElementById(\'stats-date\').value=\''+h.date+'\';renderStats();" style="padding:4px 10px;border-radius:20px;font-size:11px;cursor:pointer;border:1px solid '+(act?'var(--ac)':'var(--bor)')+';background:'+(act?'var(--ac)':'var(--sur)')+';color:'+(act?'#fff':'var(--tx)')+';">'
+      +lbl+' <span style="opacity:.6;font-size:10px;">'+(h.count||0)+'t</span></button>';
+  }).join('');
 }
 
 function parseHoraStr(s){
@@ -4057,8 +4321,8 @@ function renderStatsTrackeo(turnos, statsDate){
     const recAt=live.recepcionAt||t.recepcionAt;
     if(recAt) ev.recepcion=recAt;
     // sin recepcionAt: no mostrar hora, no calcular diferencia
-    Object.values(S.asgn||{}).flat().forEach(a=>{if(a.tid===t.id&&a.asignadoAt)ev.plan=a.asignadoAt;});
-    const fin=S.finalizados.find(f=>f.turnoId===t.id||(t.dominio&&(f.dominio||'').toUpperCase()===(t.dominio||'').toUpperCase()));
+    Object.values(getAsgnParaFecha(statsDate)).flat().forEach(a=>{if(a.tid===t.id&&a.asignadoAt)ev.plan=a.asignadoAt;});
+    const fin=finalizadoDe(t,statsDate);
     if(fin) ev.fin=fin.finAtStr||fin.finAt;
     Object.values(S.lavAsgn||{}).flat().forEach(a=>{if(a.turnoId===t.id){if(a.lavAsignadoAt)ev.lavplan=a.lavAsignadoAt;if(a.lavado)ev.lavfin=a.lavadoAtStr||a.lavadoAt;}});
     const ent=S.entregas.find(e=>e.dominio===t.dominio&&e.fecha===statsDate);
@@ -4387,7 +4651,7 @@ function openResetDB(){
   overlay.appendChild(box);
   document.body.appendChild(overlay);
   overlay.addEventListener('click',function(e){if(e.target===overlay)overlay.remove();});
-  setTimeout(function(){document.getElementById('reset-pass').focus();},80);
+  setTimeout(function(){const el=document.getElementById('reset-pass');if(el)el.focus();},80);
 }
 
 async function confirmResetDB(){
@@ -4405,7 +4669,7 @@ async function confirmResetDB(){
   S.turnos=[];S.entregas=[];S.history=[];S.asgn={};S.notifs=[];
   S.paradas=[];S.finalizados=[];S.lavAsgn={};S.lavFinalizados=[];S.ausencias={};
   S.turnosFecha='';S.htmlCargado=false;
-  S.asgnHistory={};S._base={};
+  S.asgnHistory={};S._base={};S._baseTurnos=null;S._turnosFullPend=false;
   _syncPausaHasta=Date.now()+20000; // que el sync no traiga datos viejos mientras el servidor se limpia
   localStorage.removeItem('st2');
   // Bloquear sync 15s para que no restaure datos viejos
@@ -4426,17 +4690,30 @@ async function confirmResetDB(){
 function eliminarTurnoManual(turnoId, evt){
   if(evt) evt.stopPropagation();
   if(!confirm('¿Eliminar este turno manual?')) return;
+  const _eraActivo=S.turnos.some(function(t){return t.id===turnoId;});
   S.turnos=S.turnos.filter(function(t){return t.id!==turnoId;});
   // Quitar también del historial
-  S.history.forEach(function(h){if(h.turnos)h.turnos=h.turnos.filter(function(t){return t.id!==turnoId;});});
-  // Quitar asignaciones
-  Object.keys(S.asgn).forEach(function(k){
-    S.asgn[k]=(S.asgn[k]||[]).filter(function(a){return a.tid!==turnoId;});
+  const _fechasHist=[];
+  S.history.forEach(function(h){
+    if(h.turnos&&h.turnos.some(function(t){return t.id===turnoId;})){
+      h.turnos=h.turnos.filter(function(t){return t.id!==turnoId;});
+      if(h.date!==S.turnosFecha) _fechasHist.push(h);
+    }
   });
+  // Quitar asignaciones (día activo y snapshots)
+  const _limpiar=function(A){Object.keys(A||{}).forEach(function(k){
+    if(!Array.isArray(A[k])) return;
+    A[k]=A[k].filter(function(a){return a.tid!==turnoId;});
+    if(!A[k].length) delete A[k];
+  });};
+  _limpiar(S.asgn);
+  Object.keys(S.asgnHistory||{}).forEach(function(f){_limpiar(S.asgnHistory[f]);});
   _asgnDirtyUntil=Date.now()+60000;
   saveL();
-  push('saveTurnosDelDia',{fecha:tod(),turnos:S.turnos});
+  if(_eraActivo) push('saveTurnosDelDia',{fecha:S.turnosFecha||tod(),turnos:S.turnos});
+  _fechasHist.forEach(function(h){push('saveTurnosHistorial',{date:h.date,turnos:h.turnos});});
   push('updateAsgn',S.asgn);
+  push('saveAsgnHistory',S.asgnHistory);
   renderAll();
   toast('✓ Turno manual eliminado');
 }
@@ -4768,14 +5045,31 @@ function saveTurnoManual(){
     origenAuto:_tmOrigenAuto,
     noEsNuevoIngreso:(_tmOrigenAuto==='parada'||_tmOrigenAuto==='anterior')
   };
-  S.turnos.push(t);
-  S.turnosFecha=tod();
-  S.htmlCargado=true; // esta PC tiene datos propios, no recibir del servidor
-  _turnosDirtyUntil=Date.now()+30000;
-  const hist=S.history.find(h=>h.date===tod());
-  if(hist){hist.turnos=[...S.turnos];hist.count=S.turnos.length;}
-  else S.history.push({date:tod(),count:S.turnos.length,turnos:[...S.turnos]});
-  saveL();push('saveTurnosDelDia',{fecha:tod(),turnos:S.turnos});
+  // Va al día que se está viendo (nunca a un día pasado). Antes siempre era "hoy" y,
+  // si ya estaba cargado mañana, mezclaba los días.
+  let _dia=(_tmOrigin==='plan'&&typeof planDate!=='undefined'&&planDate)?planDate:tod();
+  if(_dia<tod()) _dia=tod();
+  const _activa=(S.turnosFecha||'').substring(0,10);
+  const _hd=S.history.find(h=>h.date===_dia);
+  if(_dia===_activa){
+    S.turnos.push(t);
+    S.htmlCargado=true;
+    if(_hd){_hd.turnos=S.turnos.map(x=>Object.assign({},x));_hd.count=Math.max(_hd.count||0,S.turnos.length);}
+    else S.history.push({date:_dia,count:S.turnos.length,turnos:S.turnos.map(x=>Object.assign({},x))});
+    saveL();push('saveTurnosDelDia',{fecha:_dia,turnos:S.turnos});
+  } else if(_hd && _activa && _dia<_activa){
+    // Hoy, con el turnero de mañana ya cargado: se suma a los turnos de hoy
+    _hd.turnos=(_hd.turnos||[]).concat([t]);_hd.count=Math.max(_hd.count||0,_hd.turnos.length);
+    saveL();push('saveTurnosHistorial',{date:_dia,turnos:_hd.turnos});
+  } else {
+    // Día todavía sin turnero: se abre con este turno (+ pendientes del día anterior)
+    aplicarTurnosDia(_dia,[t],true);
+    _asgnDirtyUntil=Date.now()+60000;
+    saveL();
+    push('saveTurnosDelDia',{fecha:_dia,turnos:S.turnos,full:true});
+    push('updateAsgn',S.asgn); push('saveAsgnHistory',S.asgnHistory);
+    planDate=_dia;
+  }
   closeTurnoManual();
   renderAll();
   toast('✓ Turno manual agregado: '+dom);
@@ -5200,7 +5494,7 @@ function doPost(e) {
   }
 }
 
-// ── Parches: aplicar solo lo que cambió (asignaciones, lavadero, finalizados, entregas) ──
+// ── Parches: aplicar solo lo que cambió (asignaciones, lavadero, finalizados, entregas, turnos del día) ──
 
 function patchField(ss, p) {
   const f = p.field;
@@ -5232,7 +5526,32 @@ function patchField(ss, p) {
   else if (f === 'finalizados') {
     patchFinalizados(ss, p.upsert || [], p.del || []);
   }
+  else if (f === 'turnos') {
+    // Turnos del día: solo si el servidor sigue en el mismo día que la PC que envía
+    const cfg = readConfig(ss);
+    const fechaSrv = fechaStr(val(cfg, 'turnosFecha', ''));
+    const fechaPc  = String(p.fecha || '').substring(0, 10);
+    if (fechaSrv && fechaPc && fechaSrv !== fechaPc) throw new Error('Los turnos del servidor son de otro día (' + fechaSrv + ')');
+    var lista = val(cfg, 'turnosDelDia', []);
+    if (lista === undefined) throw new Error('No se pudo leer turnosDelDia (no se aplica el cambio)');
+    if (!Array.isArray(lista)) lista = [];
+    const borrar = {}; (p.del || []).forEach(function(id){ borrar[String(id)] = true; });
+    const pos = {}; lista.forEach(function(x, i){ if (x && x.id != null) pos[String(x.id)] = i; });
+    (p.upsert || []).forEach(function(x){
+      if (!x || x.id == null) return;
+      const k = String(x.id);
+      if (pos[k] !== undefined) lista[pos[k]] = x; else { pos[k] = lista.length; lista.push(x); }
+    });
+    lista = lista.filter(function(x){ return !(x && borrar[String(x.id)]); });
+    writeConfig(ss, 'turnosDelDia', JSON.stringify(lista));
+    if (!fechaSrv && fechaPc) writeConfig(ss, 'turnosFecha', fechaPc);
+  }
   else throw new Error('Campo no permitido: ' + f);
+}
+
+function fechaStr(v) {
+  if (v && Object.prototype.toString.call(v) === '[object Date]') return Utilities.formatDate(v, 'America/Argentina/Buenos_Aires', 'yyyy-MM-dd');
+  return String(v || '').substring(0, 10);
 }
 
 // ── Config: clave/valor con valores grandes partidos en varias filas ──────────
