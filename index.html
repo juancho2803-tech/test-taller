@@ -1180,10 +1180,50 @@ window.onload=()=>{
   setInterval(updDate,60000);
   setInterval(checkNotifs,30000);
   setInterval(()=>syncNow(true),10000);
+  setTimeout(buscarVersionNueva,20000);
+  setInterval(buscarVersionNueva,5*60000);
+  window.addEventListener('focus',function(){ if(Date.now()-_verUltimaRevision>60000) buscarVersionNueva(); });
   document.getElementById('ef').value=tod();
   document.getElementById('p-fin').value=tod();
   document.getElementById('hist-date').value=tod();
 };
+// ===== AVISO DE VERSIÓN NUEVA =====
+// Al publicar un index.html nuevo en GitHub, cambiar APP_VERSION. Cada PC revisa cada 5 min
+// (y al volver a la ventana) y, si hay otra versión, muestra un aviso con el botón "Actualizar".
+const APP_VERSION='2026-10-09.2';
+let _verUltimaRevision=0, _verPosponerHasta=0;
+async function buscarVersionNueva(){
+  _verUltimaRevision=Date.now();
+  if(!/^https?:/.test(location.protocol)) return; // abierto como archivo local: no aplica
+  if(Date.now()<_verPosponerHasta) return;
+  try{
+    const r=await fetch(location.pathname+'?ver='+Date.now(),{cache:'no-store'});
+    if(!r.ok) return;
+    const txt=await r.text();
+    const m=txt.match(/const APP_VERSION='([^']+)'/);
+    if(m && m[1]!==APP_VERSION) mostrarAvisoVersion(m[1]);
+  }catch(e){}
+}
+function mostrarAvisoVersion(nueva){
+  if(document.getElementById('aviso-version')) return;
+  const d=document.createElement('div');
+  d.id='aviso-version';
+  d.style.cssText='position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:3000;background:var(--sur);color:var(--tx);border:1px solid var(--ac);border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.25);padding:10px 14px;display:flex;align-items:center;gap:12px;font-size:13px;max-width:calc(100vw - 32px);flex-wrap:wrap;';
+  d.innerHTML='<span>🔄 <b>Hay una versión nueva</b> del tablero</span>'
+    +'<button id="btn-actualizar-version" style="padding:7px 14px;border-radius:8px;border:none;background:var(--ac);color:#fff;font-weight:700;cursor:pointer;font-size:13px;">Actualizar</button>'
+    +'<button id="btn-posponer-version" style="padding:7px 10px;border-radius:8px;border:1px solid var(--bor);background:transparent;color:var(--tx2);cursor:pointer;font-size:12px;">Más tarde</button>';
+  document.body.appendChild(d);
+  document.getElementById('btn-actualizar-version').onclick=function(){actualizarVersion(nueva);};
+  document.getElementById('btn-posponer-version').onclick=function(){d.remove();_verPosponerHasta=Date.now()+30*60000;};
+}
+async function actualizarVersion(nueva){
+  const b=document.getElementById('btn-actualizar-version');
+  if(b){b.disabled=true;b.textContent='Guardando…';}
+  // Antes de recargar, enviar lo que esté pendiente para no perder cambios
+  try{ saveL(); }catch(e){}
+  try{ await Promise.race([flushPendientes(), new Promise(function(r){setTimeout(r,8000);})]); }catch(e){}
+  location.replace(location.pathname+'?v='+encodeURIComponent(nueva));
+}
 function tod(){return fechaLocalISO(new Date());}
 // Devuelve YYYY-MM-DD en hora LOCAL (no UTC) para evitar desfase nocturno en Argentina
 function fechaLocalISO(d){
