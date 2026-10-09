@@ -1243,6 +1243,53 @@ function loadLocal(){
   Object.keys(S.asgn).forEach(function(k){ if(!Array.isArray(S.asgn[k])) delete S.asgn[k]; });
   if(!S.lavAsgn||typeof S.lavAsgn!=='object'||Array.isArray(S.lavAsgn)) S.lavAsgn={};
   Object.keys(S.lavAsgn).forEach(function(k){ if(!Array.isArray(S.lavAsgn[k])) delete S.lavAsgn[k]; });
+  if(!Array.isArray(S.turnos)) S.turnos=[];
+  if(!Array.isArray(S.history)) S.history=[];
+  try{ limpiarRepetidos(); }catch(e){}
+}
+
+// Un mismo auto (patente) no puede figurar dos veces en un día. Si quedó repetido
+// (cargas del turnero en varias PCs con ids distintos), se deja uno solo: el que está
+// planificado o tiene más datos, sumándole las marcas del otro. Las tarjetas se re-vinculan.
+function _dedupTurnosDia(lista, asgnDia){
+  if(!Array.isArray(lista)||lista.length<2) return lista;
+  const U=function(s){return String(s||'').toUpperCase().trim();};
+  const asignados=new Set();
+  Object.values(asgnDia||{}).forEach(function(arr){(Array.isArray(arr)?arr:[]).forEach(function(a){asignados.add(a.tid);});});
+  const puntaje=function(t){return (asignados.has(t.id)?8:0)+((t.asistencia&&t.asistencia!=='pendiente')?4:0)+(t.recepcionAt?2:0)+((t.express||t.rr||t.prioritario)?1:0)+(t.fueraArchivo||t.carryOver?0:0.5);};
+  const porDom={}, salida=[], remap={};
+  let hubo=false;
+  lista.forEach(function(t){
+    if(!t) return;
+    const d=U(t.dominio);
+    if(!d){ salida.push(t); return; }
+    const g=porDom[d];
+    if(!g){ porDom[d]={t:t,i:salida.length}; salida.push(t); return; }
+    hubo=true;
+    let quedo=g.t, sale=t;
+    if(puntaje(t)>puntaje(g.t)){ quedo=t; sale=g.t; salida[g.i]=t; g.t=t; }
+    if((!quedo.asistencia||quedo.asistencia==='pendiente')&&sale.asistencia&&sale.asistencia!=='pendiente') quedo.asistencia=sale.asistencia;
+    ['express','rr','prioritario'].forEach(function(c){ if(sale[c]) quedo[c]=true; });
+    if(!quedo.recepcionAt&&sale.recepcionAt) quedo.recepcionAt=sale.recepcionAt;
+    if(!sale.fueraArchivo&&!sale.carryOver&&!sale.manual){ delete quedo.fueraArchivo; }
+    if(sale.id!==quedo.id) remap[sale.id]=quedo.id;
+  });
+  if(!hubo) return lista;
+  if(asgnDia) Object.keys(asgnDia).forEach(function(k){
+    if(!Array.isArray(asgnDia[k])) return;
+    const vistos=new Set();
+    asgnDia[k]=asgnDia[k].map(function(a){return remap[a.tid]?Object.assign({},a,{tid:remap[a.tid]}):a;})
+      .filter(function(a){ if(vistos.has(a.tid)) return false; vistos.add(a.tid); return true; });
+  });
+  return salida;
+}
+function limpiarRepetidos(){
+  if(Array.isArray(S.turnos)) S.turnos=_dedupTurnosDia(S.turnos, S.asgn);
+  (S.history||[]).forEach(function(hh){
+    if(!hh||!Array.isArray(hh.turnos)) return;
+    const esActivo=hh.date===(S.turnosFecha||'').substring(0,10);
+    hh.turnos=_dedupTurnosDia(hh.turnos, esActivo?S.asgn:(S.asgnHistory&&S.asgnHistory[hh.date]));
+  });
 }
 
 // ===== SYNC =====
@@ -1578,7 +1625,13 @@ async function syncNow(silent){
           if(!snap.turnos||!snap.turnos.length) snap.turnos=turnos;
           else if(date!==(S.turnosFecha||'').substring(0,10)){
             const ids=new Set(snap.turnos.map(function(t){return t.id;}));
-            turnos.forEach(function(t){ if(t&&t.id&&!ids.has(t.id)) snap.turnos.push(t); });
+            const doms=new Set(snap.turnos.map(function(t){return String(t.dominio||'').toUpperCase();}).filter(Boolean));
+            turnos.forEach(function(t){
+              if(!t||!t.id||ids.has(t.id)) return;
+              const dm=String(t.dominio||'').toUpperCase();
+              if(dm&&doms.has(dm)) return;
+              snap.turnos.push(t); ids.add(t.id); if(dm) doms.add(dm);
+            });
           }
         } else if(turnos.length){
           S.history.push({date:date,count:turnos.length,turnos:turnos});
@@ -1603,6 +1656,7 @@ async function syncNow(silent){
     _mergeField('finalizados',d.finalizados,_t0);
     if(d.lavFinalizados) S.lavFinalizados=d.lavFinalizados;
     _recibirTurnos(d,_t0);
+    limpiarRepetidos();
     saveL();setSd('ok');renderAll();checkNotifs();if(!silent)toast('✓ Sincronizado');
     // Tras el primer sync ya se conoce la versión del servidor: enviar lo pendiente
     if(_primerSync) flushPendientes();
@@ -1770,6 +1824,7 @@ function aplicarTurnosDia(dk, nuevos, agregar){
       usados.add(old);
       const m=Object.assign({},old);
       _CAMPOS_TURNERO.forEach(function(c){ if(t[c]!==undefined) m[c]=t[c]; });
+      if(!agregar){ delete m.fueraArchivo; delete m.carryOver; delete m.carryFrom; }
       finales.push(m);
     } else if(!old) finales.push(t);
   });
@@ -1777,7 +1832,11 @@ function aplicarTurnosDia(dk, nuevos, agregar){
     if(usados.has(t)) return;
     const d=_U(t.dominio);
     if(d&&finales.some(function(x){return _U(x.dominio)===d;})) return;
-    if(agregar || t.manual || t.asistencia==='asistio' || tidsAsg.has(t.id) || esFinalizado(t,dk)) finales.push(t);
+    if(agregar) finales.push(t);
+    else if(t.manual || t.asistencia==='asistio' || tidsAsg.has(t.id) || esFinalizado(t,dk)){
+      if(!t.manual && !t.carryOver) t.fueraArchivo=true; // estaba antes pero ya no viene en el turnero
+      finales.push(t);
+    }
   });
   // Pendientes del día anterior
   const co=calcularCarryOver(dk, finales);
@@ -2425,7 +2484,8 @@ function renderT(){
   data.sort((a,b)=>(a.hora||'').localeCompare(b.hora||''));
 
   const _selDate=document.getElementById('hist-date')?document.getElementById('hist-date').value||tod():tod();
-  let all=getTurnosParaFecha(_selDate);
+  // Las tarjetas cuentan solo los turnos del archivo cargado (sin pendientes de días anteriores ni manuales)
+  let all=getTurnosParaFecha(_selDate).filter(t=>!t.carryOver&&!t.manual&&!t.fueraArchivo);
   if(sucFil!=='all') all=all.filter(t=>t.suc===sucFil);
   const sab=all.filter(t=>t.suc==='sab'); const dq=all.filter(t=>t.suc==='dq');
   const asistieron=all.filter(t=>t.asistencia==='asistio').length;
